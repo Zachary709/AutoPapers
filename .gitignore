@@ -1,0 +1,25 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+
+# Local runtime data
+library/
+reports/
+
+# Temporary files
+_codex_tmp*
+
+# OS cruft
+Thumbs.db
+Desktop.ini
