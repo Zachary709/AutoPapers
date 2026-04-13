@@ -34,13 +34,38 @@ def make_digest() -> PaperDigest:
         background="Reliable agents need better benchmarks.",
         problem="How to improve reliability in autonomous agents.",
         method="Benchmarking plus iterative refinement.",
+        experiment_setup="Experiments compare structured evaluation against a plain baseline.",
         findings=["Reliability improves under structured evaluation."],
         limitations=["The benchmark is still narrow."],
         relevance="Useful as a baseline for agent harness design.",
+        improvement_ideas=["Expand the benchmark to broader tasks."],
     )
 
 
 class PaperLibraryTests(unittest.TestCase):
+    def test_prepare_markdown_section_body_preserves_paragraphs_lists_and_formulas(self) -> None:
+        body = (
+            "本文通过相关性分析识别关键不确定性度量。包括： 1. **数据集构建**：收集多波次问卷数据。 "
+            "2. **实验设计**：统一 query 模板并比较多个指标。 $$NS=|\\{v_i:\\sum_{j=1}^{|V_k|}P(v_j|q_b)\\leq0.95\\}|$$ "
+            "- **Vocabulary Entropy (VE)**：衡量词汇分布熵。"
+        )
+
+        formatted = PaperLibrary._prepare_markdown_section_body(body)
+
+        self.assertIn("包括：\n\n1. **数据集构建**", formatted)
+        self.assertIn("2. **实验设计**", formatted)
+        self.assertIn("\n\n$$NS=|\\{v_i:\\sum_{j=1}^{|V_k|}P(v_j|q_b)\\leq0.95\\}|$$\n\n", formatted)
+        self.assertIn("- **Vocabulary Entropy (VE)**", formatted)
+        self.assertNotIn("\n##\n", formatted)
+
+    def test_prepare_markdown_section_body_splits_bracketed_subsections(self) -> None:
+        body = "【模型与数据】使用多种白盒模型并计算token概率。【分析阶段】第一阶段分析相关性，第二阶段评估预测能力。"
+
+        formatted = PaperLibrary._prepare_markdown_section_body(body)
+
+        self.assertIn("【模型与数据】", formatted)
+        self.assertIn("\n\n【分析阶段】", formatted)
+
     def test_upsert_writes_files_index_and_tree_payload(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "library"
@@ -122,3 +147,23 @@ class PaperLibraryTests(unittest.TestCase):
             self.assertIn("Updated_Agents/New_Evaluation", detail["paths"]["markdown"])
             self.assertTrue(detail["flags"]["markdown_exists"])
             self.assertTrue(detail["flags"]["pdf_exists"])
+
+    def test_markdown_omits_empty_optional_sections(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "library"
+            library = PaperLibrary(root)
+            digest = make_digest()
+            digest.experiment_setup = ""
+            digest.findings = []
+            digest.limitations = []
+            digest.improvement_ideas = []
+
+            stored = library.upsert_paper(make_paper(), digest, b"%PDF-1.4 fake content", [])
+            markdown = (Path(tmp_dir) / stored.md_path).read_text(encoding="utf-8")
+
+            self.assertIn("## 一句话概括", markdown)
+            self.assertIn("## 方法怎么理解", markdown)
+            self.assertNotIn("## 实验怎么设置", markdown)
+            self.assertNotIn("## 实验里最值得关注的点", markdown)
+            self.assertNotIn("## 局限", markdown)
+            self.assertNotIn("## 可以怎么优化", markdown)

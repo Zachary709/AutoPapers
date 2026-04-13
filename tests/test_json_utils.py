@@ -18,3 +18,17 @@ class JsonUtilsTests(unittest.TestCase):
         data = extract_json_object(payload)
         self.assertEqual(data["intent"], "explain_paper")
 
+    def test_repairs_invalid_backslashes_newlines_and_trailing_commas(self) -> None:
+        payload = (
+            '{\n'
+            '"method":"分数函数写成 $$s(y|x)=\\log p(y|x)+\\lambda v(y, x)$$\n'
+            '下一步继续分析",\n'
+            '"findings":["结果一","结果二",],\n'
+            '}'
+        )
+
+        data = extract_json_object(payload)
+
+        self.assertIn("$$s(y|x)=\\log p(y|x)+\\lambda v(y, x)$$", data["method"])
+        self.assertIn("\n下一步继续分析", data["method"])
+        self.assertEqual(data["findings"], ["结果一", "结果二"])

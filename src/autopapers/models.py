@@ -34,13 +34,15 @@ class PaperDigest:
     major_topic: str
     minor_topic: str
     keywords: list[str]
-    one_sentence_takeaway: str
-    background: str
-    problem: str
-    method: str
-    findings: list[str]
-    limitations: list[str]
-    relevance: str
+    one_sentence_takeaway: str = ""
+    background: str = ""
+    problem: str = ""
+    method: str = ""
+    experiment_setup: str = ""
+    findings: list[str] = field(default_factory=list)
+    limitations: list[str] = field(default_factory=list)
+    relevance: str = ""
+    improvement_ideas: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -75,9 +77,11 @@ class StoredPaper:
                 "background": self.digest.background,
                 "problem": self.digest.problem,
                 "method": self.digest.method,
+                "experiment_setup": self.digest.experiment_setup,
                 "findings": self.digest.findings,
                 "limitations": self.digest.limitations,
                 "relevance": self.digest.relevance,
+                "improvement_ideas": self.digest.improvement_ideas,
             },
             "stored_at": self.stored_at,
             "pdf_path": self.pdf_path,
@@ -88,7 +92,21 @@ class StoredPaper:
     @classmethod
     def from_dict(cls, data: dict) -> "StoredPaper":
         paper = Paper(**data["paper"])
-        digest = PaperDigest(**data["digest"])
+        digest_data = data["digest"]
+        digest = PaperDigest(
+            major_topic=digest_data.get("major_topic", "未分类方向"),
+            minor_topic=digest_data.get("minor_topic", "待整理子方向"),
+            keywords=list(digest_data.get("keywords", [])),
+            one_sentence_takeaway=digest_data.get("one_sentence_takeaway", ""),
+            background=digest_data.get("background", ""),
+            problem=digest_data.get("problem", ""),
+            method=digest_data.get("method", ""),
+            experiment_setup=digest_data.get("experiment_setup", ""),
+            findings=list(digest_data.get("findings", [])),
+            limitations=list(digest_data.get("limitations", [])),
+            relevance=digest_data.get("relevance", ""),
+            improvement_ideas=list(digest_data.get("improvement_ideas", [])),
+        )
         return cls(
             paper=paper,
             digest=digest,
@@ -107,4 +125,3 @@ class RunResult:
     related_papers: list[StoredPaper]
     report_markdown: str
     report_path: str
-

@@ -5,11 +5,13 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 
 from autopapers.models import Paper, PaperDigest, StoredPaper
 from autopapers.utils import (
     extract_paper_reference_text,
+    normalize_whitespace,
     normalize_title_key,
     sanitize_path_component,
     title_similarity,
@@ -81,7 +83,11 @@ class PaperLibrary:
                         record.digest.major_topic,
                         record.digest.minor_topic,
                         record.digest.one_sentence_takeaway,
+                        record.digest.problem,
+                        record.digest.method,
+                        record.digest.relevance,
                         " ".join(record.digest.keywords),
+                        " ".join(record.digest.findings),
                     ]
                 )
             )
@@ -329,27 +335,36 @@ class PaperLibrary:
         if not related_lines:
             related_lines.append("- 暂无。")
 
-        findings = "\n".join(f"- {item}" for item in stored.digest.findings)
-        limitations = "\n".join(f"- {item}" for item in stored.digest.limitations)
         keywords = ", ".join(stored.digest.keywords)
-        return (
-            f"# {stored.paper.title}\n\n"
-            f"- arXiv ID: `{stored.paper.versioned_id or stored.paper.arxiv_id}`\n"
-            f"- Authors: {', '.join(stored.paper.authors)}\n"
-            f"- Published: {stored.paper.published}\n"
-            f"- Topics: {stored.digest.major_topic} / {stored.digest.minor_topic}\n"
-            f"- Keywords: {keywords}\n"
-            f"{pdf_line}\n\n"
-            f"## Abstract\n\n{stored.paper.abstract}\n\n"
-            f"## One-Sentence Takeaway\n\n{stored.digest.one_sentence_takeaway}\n\n"
-            f"## Background\n\n{stored.digest.background}\n\n"
-            f"## Core Problem\n\n{stored.digest.problem}\n\n"
-            f"## Method\n\n{stored.digest.method}\n\n"
-            f"## Findings\n\n{findings}\n\n"
-            f"## Limitations\n\n{limitations}\n\n"
-            f"## Relevance\n\n{stored.digest.relevance}\n\n"
-            f"## Related Local Papers\n\n" + "\n".join(related_lines) + "\n"
-        )
+        lines = [
+            f"# {stored.paper.title}",
+            "",
+            f"- arXiv ID: `{stored.paper.versioned_id or stored.paper.arxiv_id}`",
+            f"- Authors: {', '.join(stored.paper.authors)}",
+            f"- Published: {stored.paper.published}",
+            f"- Topics: {stored.digest.major_topic} / {stored.digest.minor_topic}",
+            f"- Keywords: {keywords}",
+            pdf_line,
+            "",
+            "## 摘要",
+            "",
+            stored.paper.abstract,
+            "",
+        ]
+        self._append_markdown_section(lines, "一句话概括", stored.digest.one_sentence_takeaway)
+        self._append_markdown_section(lines, "论文在做什么", stored.digest.problem)
+        self._append_markdown_section(lines, "直觉上为什么成立", stored.digest.background)
+        self._append_markdown_section(lines, "方法怎么理解", stored.digest.method)
+        self._append_markdown_section(lines, "实验怎么设置", stored.digest.experiment_setup)
+        self._append_markdown_list_section(lines, "实验里最值得关注的点", stored.digest.findings)
+        self._append_markdown_section(lines, "这篇论文的价值", stored.digest.relevance)
+        self._append_markdown_list_section(lines, "局限", stored.digest.limitations)
+        self._append_markdown_list_section(lines, "可以怎么优化", stored.digest.improvement_ideas)
+        lines.append("## Related Local Papers")
+        lines.append("")
+        lines.extend(related_lines)
+        lines.append("")
+        return "\n".join(lines)
 
     def _render_root_summary(self, records: list[StoredPaper]) -> str:
         lines = ["# AutoPapers Library", ""]
@@ -417,3 +432,50 @@ class PaperLibrary:
     @staticmethod
     def _relative_between(from_dir: Path, to_path: Path) -> str:
         return Path(os.path.relpath(to_path, start=from_dir)).as_posix()
+
+    @staticmethod
+    def _prepare_markdown_section_body(body: str) -> str:
+        raw = str(body or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not raw:
+            return ""
+        text = raw
+        text = re.sub(r"\s*(\$\$.*?\$\$)\s*", r"\n\n\1\n\n", text, flags=re.S)
+        text = re.sub(r"(?<!^)(?=【[^】]+】)", "\n\n", text)
+        text = re.sub(r"([：:])\s+(?=(?:\d+\.\s+\*\*|\d+\.\s+|[-*]\s+\*\*))", r"\1\n\n", text)
+        text = re.sub(r"\s+(?=(?:\d+\.\s+\*\*|\d+\.\s+[\u4e00-\u9fffA-Za-z]|[-*]\s+\*\*))", "\n\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        lines = []
+        for line in text.split("\n"):
+            normalized = normalize_whitespace(line) if line.strip() else ""
+            if normalized in {"#", "##", "###", "####"}:
+                normalized = ""
+            lines.append(normalized)
+        cleaned: list[str] = []
+        blank_run = 0
+        for line in lines:
+            if not line:
+                blank_run += 1
+                if blank_run <= 2 and cleaned:
+                    cleaned.append("")
+                continue
+            blank_run = 0
+            cleaned.append(line)
+        while cleaned and not cleaned[-1]:
+            cleaned.pop()
+        return "\n".join(cleaned).strip()
+
+    @staticmethod
+    def _append_markdown_section(lines: list[str], title: str, body: str) -> None:
+        formatted = PaperLibrary._prepare_markdown_section_body(body)
+        if not formatted:
+            return
+        lines.extend([f"## {title}", "", formatted, ""])
+
+    @staticmethod
+    def _append_markdown_list_section(lines: list[str], title: str, items: list[str]) -> None:
+        normalized_items = [normalize_whitespace(item) for item in items if normalize_whitespace(item)]
+        if not normalized_items:
+            return
+        lines.extend([f"## {title}", ""])
+        lines.extend(f"- {item}" for item in normalized_items)
+        lines.append("")

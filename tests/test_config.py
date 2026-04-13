@@ -24,3 +24,12 @@ class ConfigTests(unittest.TestCase):
             settings = Settings.from_env(root)
 
             self.assertEqual(settings.network_proxy_url, "http://127.0.0.1:7890")
+
+    def test_from_env_uses_expanded_pdf_defaults(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+
+            settings = Settings.from_env(root)
+
+            self.assertEqual(settings.pdf_max_pages, 18)
+            self.assertEqual(settings.pdf_max_chars, 45000)

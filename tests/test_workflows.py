@@ -6,7 +6,9 @@ import unittest
 
 from autopapers.library import PaperLibrary
 from autopapers.models import Paper, PaperDigest, RequestPlan, RunResult
+from autopapers.pdf import ExtractedPaperContent
 from autopapers.retrieval import SearchSpec
+from autopapers.taxonomy import TopicTaxonomy
 from autopapers.workflows import AutoPapersAgent
 
 
@@ -35,9 +37,11 @@ def make_digest() -> PaperDigest:
         background="Background",
         problem="Problem",
         method="Method",
+        experiment_setup="Experiment setup",
         findings=["Finding"],
         limitations=["Limitation"],
         relevance="Relevant",
+        improvement_ideas=["Improve verifier calibration."],
     )
 
 
@@ -80,17 +84,26 @@ class FakeDiscoverySearchPlanner:
 class FakePlanner:
     def __init__(self, plan: RequestPlan) -> None:
         self.plan = plan
+        self.last_extracted_text = None
 
     def plan_request(self, *args, **kwargs) -> RequestPlan:
         return self.plan
 
     def digest_paper(self, *args, **kwargs) -> PaperDigest:
+        if len(args) >= 3:
+            self.last_extracted_text = args[2]
         return make_digest()
 
 
 class FakeExtractor:
+    def __init__(self, content: ExtractedPaperContent | None = None) -> None:
+        self.content = content or ExtractedPaperContent(raw_body="Parsed PDF body")
+
     def extract(self, pdf_bytes: bytes) -> str:
-        return ""
+        return self.content.raw_body
+
+    def extract_structured(self, pdf_bytes: bytes) -> ExtractedPaperContent:
+        return self.content
 
 
 class FakeSettings:
@@ -116,6 +129,7 @@ class WorkflowDiscoveryTests(unittest.TestCase):
                 SearchSpec(query=relaxed_query, field="raw", sort_by="submittedDate"),
             ]
         )
+        agent.taxonomy = TopicTaxonomy()
         plan = RequestPlan(
             intent="discover_papers",
             user_goal="test",
@@ -157,6 +171,7 @@ class WorkflowDiscoveryTests(unittest.TestCase):
                 SearchSpec(query=second_query, field="raw"),
             ]
         )
+        agent.taxonomy = TopicTaxonomy()
         plan = RequestPlan(
             intent="discover_papers",
             user_goal="test",
@@ -185,6 +200,7 @@ class WorkflowDiscoveryTests(unittest.TestCase):
             agent = AutoPapersAgent.__new__(AutoPapersAgent)
             agent.library = library
             agent.arxiv = FakeArxivClient({})
+            agent.taxonomy = TopicTaxonomy()
 
             plan = RequestPlan(
                 intent="explain_paper",
@@ -220,6 +236,7 @@ class WorkflowDiscoveryTests(unittest.TestCase):
             agent = AutoPapersAgent.__new__(AutoPapersAgent)
             agent.library = library
             agent.arxiv = FakeArxivClient({})
+            agent.taxonomy = TopicTaxonomy()
 
             plan = RequestPlan(
                 intent="explain_paper",
@@ -249,6 +266,7 @@ class WorkflowDiscoveryTests(unittest.TestCase):
             agent = AutoPapersAgent.__new__(AutoPapersAgent)
             agent.library = library
             agent.arxiv = FakeArxivClient({})
+            agent.taxonomy = TopicTaxonomy()
 
             plan = RequestPlan(
                 intent="explain_paper",
@@ -296,10 +314,12 @@ class WorkflowDiscoveryTests(unittest.TestCase):
             agent = AutoPapersAgent.__new__(AutoPapersAgent)
             agent.settings = FakeSettings(root)
             agent.library = library
-            agent.planner = FakePlanner(plan)
+            planner = FakePlanner(plan)
+            agent.planner = planner
             agent.arxiv = FakeArxivClient({})
             agent.discovery_search_planner = FakeDiscoverySearchPlanner([])
-            agent.extractor = FakeExtractor()
+            agent.extractor = FakeExtractor(ExtractedPaperContent(method="PDF-grounded method text."))
+            agent.taxonomy = TopicTaxonomy()
 
             result = agent.run(plan.paper_refs[0])
 
@@ -349,7 +369,8 @@ class WorkflowDiscoveryTests(unittest.TestCase):
             agent.planner = FakePlanner(plan)
             agent.arxiv = FakeArxivClient({})
             agent.discovery_search_planner = FakeDiscoverySearchPlanner([])
-            agent.extractor = FakeExtractor()
+            agent.extractor = FakeExtractor(ExtractedPaperContent(method="PDF-grounded comparison text."))
+            agent.taxonomy = TopicTaxonomy()
 
             result = agent.run("请对比这两篇论文")
 
@@ -379,7 +400,8 @@ class WorkflowDiscoveryTests(unittest.TestCase):
             agent.planner = FakePlanner(plan)
             agent.arxiv = FakeArxivClient({"llm uncertainty": [make_paper("2604.09999", "Progressive Logging for Agents")]})
             agent.discovery_search_planner = FakeDiscoverySearchPlanner([SearchSpec(query="llm uncertainty", field="all")])
-            agent.extractor = FakeExtractor()
+            agent.extractor = FakeExtractor(ExtractedPaperContent(method="Method body for notice test."))
+            agent.taxonomy = TopicTaxonomy()
 
             notices: list[str] = []
             result = agent.run("帮我找一篇论文", notice_callback=notices.append)
@@ -392,5 +414,107 @@ class WorkflowDiscoveryTests(unittest.TestCase):
             self.assertIn("检索 arXiv 第 1 轮", joined)
             self.assertIn("处理论文 1/1", joined)
             self.assertIn("已下载 PDF", joined)
+            self.assertIn("已提取正文片段", joined)
             self.assertIn("已写入本地库", joined)
             self.assertIn("任务完成，报告已保存", joined)
+            self.assertIsInstance(agent.planner.last_extracted_text, ExtractedPaperContent)
+            self.assertEqual(agent.planner.last_extracted_text.method, "Method body for notice test.")
+
+    def test_reanalyze_library_updates_existing_records_from_local_pdf(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            library = PaperLibrary(root / "library")
+            library.upsert_paper(
+                make_paper("2401.12345", "Trust but Verify! A Survey on Verification Design for Test-time Scaling"),
+                make_digest(),
+                b"%PDF-1.4 fake content",
+                [],
+            )
+            plan = RequestPlan(
+                intent="explain_paper",
+                user_goal="重新分析",
+                search_query="",
+                paper_refs=[],
+                max_results=1,
+                reuse_local=True,
+                rationale="",
+            )
+
+            class RefreshPlanner(FakePlanner):
+                def digest_paper(self, *args, **kwargs) -> PaperDigest:
+                    self.last_extracted_text = args[2]
+                    refreshed = make_digest()
+                    refreshed.one_sentence_takeaway = "Refreshed from PDF."
+                    refreshed.method = "Updated method explanation from the PDF body."
+                    refreshed.experiment_setup = "Updated evaluation setup from the PDF body."
+                    refreshed.improvement_ideas = ["Collect more challenging evaluation sets."]
+                    return refreshed
+
+            agent = AutoPapersAgent.__new__(AutoPapersAgent)
+            agent.settings = FakeSettings(root)
+            agent.library = library
+            planner = RefreshPlanner(plan)
+            agent.planner = planner
+            agent.arxiv = FakeArxivClient({})
+            agent.discovery_search_planner = FakeDiscoverySearchPlanner([])
+            agent.extractor = FakeExtractor(
+                ExtractedPaperContent(
+                    method="Structured method text from PDF.",
+                    experiments="Structured experiments text from PDF.",
+                )
+            )
+            agent.taxonomy = TopicTaxonomy()
+
+            notices: list[str] = []
+            updated = agent.reanalyze_library(notice_callback=notices.append)
+
+            self.assertEqual(len(updated), 1)
+            self.assertEqual(updated[0].digest.one_sentence_takeaway, "Refreshed from PDF.")
+            self.assertEqual(updated[0].digest.experiment_setup, "Updated evaluation setup from the PDF body.")
+            self.assertIsInstance(planner.last_extracted_text, ExtractedPaperContent)
+            self.assertEqual(planner.last_extracted_text.method, "Structured method text from PDF.")
+            detail = library.get_paper_detail("2401.12345")
+            self.assertEqual(detail["digest"]["one_sentence_takeaway"], "Refreshed from PDF.")
+            self.assertIn("重新分析论文 1/1", "\n".join(notices))
+
+    def test_normalize_library_topics_rehomes_same_family_papers(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            library = PaperLibrary(root / "library")
+
+            first_digest = make_digest()
+            first_digest.major_topic = "Test-time_Compute_Scaling"
+            first_digest.minor_topic = "LLM_Verifier_RL"
+            library.upsert_paper(
+                make_paper("2505.04842", "Putting the Value Back in RL: Better Test-Time Scaling by Unifying LLM Reasoners With Verifiers"),
+                first_digest,
+                b"%PDF-1.4 fake content",
+                [],
+            )
+
+            second_digest = make_digest()
+            second_digest.major_topic = "大语言模型测试时计算"
+            second_digest.minor_topic = "语言代理推理增强"
+            library.upsert_paper(
+                make_paper("2506.12928", "Scaling Test-time Compute for LLM Agents"),
+                second_digest,
+                b"%PDF-1.4 fake content",
+                [],
+            )
+
+            agent = AutoPapersAgent.__new__(AutoPapersAgent)
+            agent.settings = FakeSettings(root)
+            agent.library = library
+            agent.taxonomy = TopicTaxonomy()
+
+            notices: list[str] = []
+            updated = agent.normalize_library_topics(notice_callback=notices.append)
+
+            self.assertEqual(len(updated), 2)
+            first = library.get_paper_detail("2505.04842")
+            second = library.get_paper_detail("2506.12928")
+            self.assertEqual(first["digest"]["major_topic"], "测试时计算扩展")
+            self.assertEqual(second["digest"]["major_topic"], "测试时计算扩展")
+            self.assertEqual(first["digest"]["minor_topic"], "验证器与判断器")
+            self.assertEqual(second["digest"]["minor_topic"], "语言代理与工具使用")
+            self.assertIn("规范化主题", "\n".join(notices))

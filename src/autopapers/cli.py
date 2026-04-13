@@ -27,6 +27,15 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--port", type=int, default=None, help="Bind port for the web server")
 
     subparsers.add_parser("rebuild-summaries", help="Rebuild folder summaries from the local index")
+    subparsers.add_parser("normalize-topics", help="Normalize local paper topics into the canonical taxonomy")
+    reanalyze_parser = subparsers.add_parser("reanalyze-library", help="Re-analyze papers from local PDFs")
+    reanalyze_parser.add_argument("--limit", type=int, default=None, help="Only re-analyze the most recent N papers")
+    reanalyze_parser.add_argument("--arxiv-id", action="append", default=None, help="Restrict re-analysis to specific arXiv IDs")
+    reanalyze_parser.add_argument(
+        "--download-missing-pdf",
+        action="store_true",
+        help="Attempt to download the PDF when the local copy is missing",
+    )
     return parser
 
 
@@ -44,6 +53,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "rebuild-summaries":
         agent.rebuild_summaries()
         print("Rebuilt library summaries.")
+        return 0
+
+    if args.command == "normalize-topics":
+        updated = agent.normalize_library_topics(notice_callback=print)
+        print(f"Normalized topics for {len(updated)} paper(s).")
+        return 0
+
+    if args.command == "reanalyze-library":
+        if not settings.api_key:
+            parser.error("MINIMAX_API_KEY is required. Copy .env.example to .env and fill it in.")
+        updated = agent.reanalyze_library(
+            arxiv_ids=args.arxiv_id,
+            limit=args.limit,
+            download_missing_pdf=args.download_missing_pdf,
+            notice_callback=print,
+        )
+        print(f"Re-analyzed {len(updated)} paper(s).")
         return 0
 
     if not settings.api_key:

@@ -1,6 +1,8 @@
 const state = {
   app: null,
   library: null,
+  activeMajorTopic: null,
+  activeMinorTopic: "__all__",
   selectedPaperId: null,
   selectedPaper: null,
   selectedPaperRequestId: 0,
@@ -18,7 +20,36 @@ const state = {
 const elements = {};
 const layoutKeys = {
   chatWidth: "autopapers.layout.chatWidth",
+  chatCollapsed: "autopapers.layout.chatCollapsed",
+  directoryCollapsed: "autopapers.layout.directoryCollapsed",
   previewWidth: "autopapers.layout.previewWidth",
+  previewCollapsed: "autopapers.layout.previewCollapsed",
+};
+const layoutConfig = {
+  splitterSize: 14,
+  minChatWidth: 300,
+  minDirectoryWidth: 360,
+  minPreviewWidth: 340,
+  collapseThreshold: 188,
+  expandThreshold: 240,
+};
+const layoutState = {
+  chatWidth: null,
+  previewWidth: null,
+  chatCollapsed: false,
+  directoryCollapsed: false,
+  previewCollapsed: false,
+};
+const panelLabels = {
+  chat: "LLM",
+  directory: "Directory",
+  preview: "Preview",
+};
+const mathRenderState = {
+  pendingRoots: new Set(),
+  scheduled: false,
+  retryCount: 0,
+  maxRetries: 20,
 };
 
 document.addEventListener("DOMContentLoaded", async () => {
@@ -36,6 +67,10 @@ function bindElements() {
   elements.previewPanel = document.getElementById("previewPanel");
   elements.libraryStats = document.getElementById("libraryStats");
   elements.libraryFilter = document.getElementById("libraryFilter");
+  elements.majorRail = document.getElementById("majorRail");
+  elements.libraryBreadcrumb = document.getElementById("libraryBreadcrumb");
+  elements.minorTabs = document.getElementById("minorTabs");
+  elements.librarySummary = document.getElementById("librarySummary");
   elements.libraryTree = document.getElementById("libraryTree");
   elements.paperDetail = document.getElementById("paperDetail");
   elements.chatDirectorySplitter = document.getElementById("chatDirectorySplitter");
@@ -64,6 +99,25 @@ function bindEvents() {
       return;
     }
     void selectPaper(button.getAttribute("data-paper-id"));
+  });
+
+  elements.majorRail.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-major-topic]");
+    if (!button || !elements.majorRail.contains(button)) {
+      return;
+    }
+    state.activeMajorTopic = button.getAttribute("data-major-topic");
+    state.activeMinorTopic = "__all__";
+    renderLibrary();
+  });
+
+  elements.minorTabs.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-minor-topic]");
+    if (!button || !elements.minorTabs.contains(button)) {
+      return;
+    }
+    state.activeMinorTopic = button.getAttribute("data-minor-topic") || "__all__";
+    renderLibrary();
   });
 
   elements.composerForm.addEventListener("submit", async (event) => {
@@ -123,10 +177,11 @@ function bindEvents() {
 }
 
 function initializeResizableLayout() {
-  applyStoredLayout();
+  loadStoredLayoutState();
+  syncShellLayout({ persist: false });
   bindResizableSplitters();
   window.addEventListener("resize", () => {
-    clampLayoutToViewport();
+    syncShellLayout({ persist: false });
   });
 }
 
@@ -136,6 +191,7 @@ function bindResizableSplitters() {
     bodyClass: "is-resizing-col",
     getStartValue: () => getCurrentChatWidth(),
     applyDelta: (startValue, delta) => setChatPanelWidth(startValue + delta),
+    getRestorePanel: () => getSplitterRestoreTarget("chat", "directory", "chat"),
     step: 28,
     onKeyAdjust: (delta) => setChatPanelWidth(getCurrentChatWidth() + delta),
   });
@@ -145,6 +201,7 @@ function bindResizableSplitters() {
     bodyClass: "is-resizing-col",
     getStartValue: () => getCurrentPreviewWidth(),
     applyDelta: (startValue, delta) => setPreviewPanelWidth(startValue - delta),
+    getRestorePanel: () => getSplitterRestoreTarget("directory", "preview", "preview"),
     step: 28,
     onKeyAdjust: (delta) => setPreviewPanelWidth(getCurrentPreviewWidth() - delta),
   });
@@ -155,45 +212,81 @@ function bindDragSplitter(handle, options) {
     return;
   }
 
+  const startDrag = (pointerId, startPointer, pointerType = "mouse") => {
+    const startValue = options.getStartValue();
+    let moved = false;
+    handle.classList.add("dragging");
+    document.body.classList.add(options.bodyClass);
+
+    const onMove = (moveEvent) => {
+      if (pointerId !== null && "pointerId" in moveEvent && moveEvent.pointerId !== pointerId) {
+        return;
+      }
+      const currentPointer = options.axis === "x" ? moveEvent.clientX : moveEvent.clientY;
+      moved = moved || Math.abs(currentPointer - startPointer) > 3;
+      options.applyDelta(startValue, currentPointer - startPointer);
+    };
+
+    const stop = (endEvent) => {
+      if (pointerId !== null && "pointerId" in endEvent && endEvent.pointerId !== pointerId) {
+        return;
+      }
+      handle.classList.remove("dragging");
+      document.body.classList.remove(options.bodyClass);
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", stop);
+      document.removeEventListener("pointercancel", stop);
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", stop);
+      if (!moved) {
+        const restorePanel = options.getRestorePanel?.();
+        if (restorePanel) {
+          expandPanel(restorePanel);
+        }
+      }
+    };
+
+    if (pointerType === "pointer") {
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", stop);
+      document.addEventListener("pointercancel", stop);
+    } else {
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", stop);
+    }
+  };
+
   handle.addEventListener("pointerdown", (event) => {
     if (event.button !== 0 || !isDesktopLayout()) {
       return;
     }
     event.preventDefault();
-    const pointerId = event.pointerId;
-    const startValue = options.getStartValue();
     const startPointer = options.axis === "x" ? event.clientX : event.clientY;
-    handle.classList.add("dragging");
-    document.body.classList.add(options.bodyClass);
-    handle.setPointerCapture(pointerId);
+    startDrag(event.pointerId ?? null, startPointer, "pointer");
+  });
 
-    const onMove = (moveEvent) => {
-      if (moveEvent.pointerId !== pointerId) {
-        return;
-      }
-      const currentPointer = options.axis === "x" ? moveEvent.clientX : moveEvent.clientY;
-      options.applyDelta(startValue, currentPointer - startPointer);
-    };
-
-    const stop = (endEvent) => {
-      if (endEvent.pointerId !== pointerId) {
-        return;
-      }
-      handle.classList.remove("dragging");
-      document.body.classList.remove(options.bodyClass);
-      handle.releasePointerCapture(pointerId);
-      handle.removeEventListener("pointermove", onMove);
-      handle.removeEventListener("pointerup", stop);
-      handle.removeEventListener("pointercancel", stop);
-    };
-
-    handle.addEventListener("pointermove", onMove);
-    handle.addEventListener("pointerup", stop);
-    handle.addEventListener("pointercancel", stop);
+  handle.addEventListener("mousedown", (event) => {
+    if (event.button !== 0 || !isDesktopLayout()) {
+      return;
+    }
+    if (window.PointerEvent) {
+      return;
+    }
+    event.preventDefault();
+    const startPointer = options.axis === "x" ? event.clientX : event.clientY;
+    startDrag(null, startPointer, "mouse");
   });
 
   handle.addEventListener("keydown", (event) => {
     if (!isDesktopLayout()) {
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      const restorePanel = options.getRestorePanel?.();
+      if (restorePanel) {
+        event.preventDefault();
+        expandPanel(restorePanel);
+      }
       return;
     }
     const horizontal = options.axis === "x";
@@ -208,72 +301,334 @@ function bindDragSplitter(handle, options) {
   });
 }
 
-function applyStoredLayout() {
-  if (!isDesktopLayout()) {
-    return;
-  }
-  const storedChatWidth = readStoredNumber(layoutKeys.chatWidth);
-  const storedPreviewWidth = readStoredNumber(layoutKeys.previewWidth);
-
-  if (storedChatWidth) {
-    setChatPanelWidth(storedChatWidth);
-  }
-  if (storedPreviewWidth) {
-    setPreviewPanelWidth(storedPreviewWidth);
-  }
-  clampLayoutToViewport();
+function loadStoredLayoutState() {
+  layoutState.chatWidth = readStoredNumber(layoutKeys.chatWidth);
+  layoutState.previewWidth = readStoredNumber(layoutKeys.previewWidth);
+  layoutState.chatCollapsed = readStoredBoolean(layoutKeys.chatCollapsed, false);
+  layoutState.directoryCollapsed = readStoredBoolean(layoutKeys.directoryCollapsed, false);
+  layoutState.previewCollapsed = readStoredBoolean(layoutKeys.previewCollapsed, false);
 }
 
-function clampLayoutToViewport() {
-  if (!isDesktopLayout()) {
+function syncShellLayout({ persist = true } = {}) {
+  if (!elements.appShell) {
     return;
   }
-  setChatPanelWidth(getCurrentChatWidth(), { persist: false });
-  setPreviewPanelWidth(getCurrentPreviewWidth(), { persist: false });
+  if (!isDesktopLayout()) {
+    elements.appShell.style.removeProperty("grid-template-columns");
+    [elements.chatPanel, elements.directoryPanel, elements.previewPanel].forEach((panel) => {
+      panel?.classList.remove("is-collapsed", "panel-leading", "panel-trailing", "panel-solo");
+      if (panel) {
+        panel.removeAttribute("aria-hidden");
+      }
+    });
+    [elements.chatDirectorySplitter, elements.directoryPreviewSplitter].forEach((splitter) => {
+      splitter?.classList.remove("is-collapsed-handle");
+      splitter?.removeAttribute("data-restore-panel");
+      splitter?.setAttribute("aria-label", splitter?.id === "chatDirectorySplitter" ? "调整对话区和目录区宽度" : "调整目录区和预览区宽度");
+      const label = splitter?.querySelector(".splitter-label");
+      if (label) {
+        label.textContent = "";
+      }
+    });
+    return;
+  }
+
+  ensureAtLeastOneVisiblePanel();
+  const resolved = resolveTrackWidths();
+  layoutState.chatWidth = layoutState.chatCollapsed ? resolved.chatWidth || layoutState.chatWidth : resolved.chatWidth;
+  layoutState.previewWidth = layoutState.previewCollapsed ? resolved.previewWidth || layoutState.previewWidth : resolved.previewWidth;
+  elements.appShell.style.gridTemplateColumns = `${resolved.chatWidth}px ${layoutConfig.splitterSize}px ${resolved.directoryWidth}px ${layoutConfig.splitterSize}px ${resolved.previewWidth}px`;
+  updatePanelChrome(resolved);
+  if (persist) {
+    persistLayoutState();
+  }
+}
+
+function resolveTrackWidths() {
+  const shellWidth = Math.max(elements.appShell?.clientWidth || window.innerWidth, 0);
+  const splitTotal = layoutConfig.splitterSize * 2;
+  let chatWidth = layoutState.chatCollapsed ? 0 : clamp(
+    layoutState.chatWidth ?? getDefaultChatWidth(shellWidth),
+    layoutConfig.minChatWidth,
+    shellWidth
+  );
+  let previewWidth = layoutState.previewCollapsed ? 0 : clamp(
+    layoutState.previewWidth ?? getDefaultPreviewWidth(shellWidth),
+    layoutConfig.minPreviewWidth,
+    shellWidth
+  );
+
+  if (layoutState.directoryCollapsed) {
+    [chatWidth, previewWidth] = fitTrackPair({
+      first: chatWidth,
+      second: previewWidth,
+      firstMin: layoutState.chatCollapsed ? 0 : layoutConfig.minChatWidth,
+      secondMin: layoutState.previewCollapsed ? 0 : layoutConfig.minPreviewWidth,
+      available: Math.max(0, shellWidth - splitTotal),
+    });
+    return {
+      shellWidth,
+      chatWidth,
+      directoryWidth: 0,
+      previewWidth,
+    };
+  }
+
+  [chatWidth, previewWidth] = fitTrackPair({
+    first: chatWidth,
+    second: previewWidth,
+    firstMin: layoutState.chatCollapsed ? 0 : layoutConfig.minChatWidth,
+    secondMin: layoutState.previewCollapsed ? 0 : layoutConfig.minPreviewWidth,
+    available: Math.max(0, shellWidth - splitTotal - layoutConfig.minDirectoryWidth),
+  });
+
+  return {
+    shellWidth,
+    chatWidth,
+    directoryWidth: Math.max(0, shellWidth - splitTotal - chatWidth - previewWidth),
+    previewWidth,
+  };
+}
+
+function ensureAtLeastOneVisiblePanel() {
+  if (getExpandedPanelCount() > 0) {
+    return;
+  }
+  layoutState.directoryCollapsed = false;
+}
+
+function fitTrackPair({ first, second, firstMin, secondMin, available }) {
+  let nextFirst = Math.max(0, first);
+  let nextSecond = Math.max(0, second);
+  if (nextFirst + nextSecond <= available) {
+    return [nextFirst, nextSecond];
+  }
+
+  let overflow = nextFirst + nextSecond - available;
+  const firstReducible = Math.max(0, nextFirst - firstMin);
+  const secondReducible = Math.max(0, nextSecond - secondMin);
+  const totalReducible = firstReducible + secondReducible;
+
+  if (totalReducible <= 0) {
+    return [Math.max(0, firstMin), Math.max(0, secondMin)];
+  }
+
+  const firstShare = firstReducible / totalReducible;
+  let reduceFirst = Math.min(firstReducible, overflow * firstShare);
+  let reduceSecond = Math.min(secondReducible, overflow - reduceFirst);
+  overflow -= reduceFirst + reduceSecond;
+
+  if (overflow > 0 && reduceFirst < firstReducible) {
+    const extra = Math.min(firstReducible - reduceFirst, overflow);
+    reduceFirst += extra;
+    overflow -= extra;
+  }
+  if (overflow > 0 && reduceSecond < secondReducible) {
+    const extra = Math.min(secondReducible - reduceSecond, overflow);
+    reduceSecond += extra;
+  }
+
+  nextFirst = Math.max(firstMin, nextFirst - reduceFirst);
+  nextSecond = Math.max(secondMin, nextSecond - reduceSecond);
+  return [nextFirst, nextSecond];
 }
 
 function setChatPanelWidth(width, { persist = true } = {}) {
-  const bounds = getShellBounds(getCurrentPreviewWidth(), 300);
-  const clamped = clamp(width, bounds.min, bounds.max);
-  elements.appShell?.style.setProperty("--layout-chat-width", `${Math.round(clamped)}px`);
-  if (persist) {
-    persistLayoutValue(layoutKeys.chatWidth, clamped);
+  const desired = Math.max(0, Number(width) || 0);
+
+  if (layoutState.chatCollapsed) {
+    if (desired < layoutConfig.expandThreshold) {
+      syncShellLayout({ persist });
+      return;
+    }
+    layoutState.chatCollapsed = false;
+  } else if (desired < layoutConfig.collapseThreshold && canCollapsePanel("chat")) {
+    layoutState.chatCollapsed = true;
+    syncShellLayout({ persist });
+    return;
   }
+
+  layoutState.chatWidth = desired;
+
+  const currentPreviewWidth = resolveTrackWidths().previewWidth;
+  const potentialDirectoryWidth = getPotentialDirectoryWidth(layoutState.chatWidth, currentPreviewWidth);
+  if (layoutState.directoryCollapsed && potentialDirectoryWidth >= layoutConfig.expandThreshold) {
+    layoutState.directoryCollapsed = false;
+  } else if (!layoutState.directoryCollapsed && potentialDirectoryWidth < layoutConfig.collapseThreshold && canCollapsePanel("directory")) {
+    layoutState.directoryCollapsed = true;
+  }
+
+  syncShellLayout({ persist });
 }
 
 function setPreviewPanelWidth(width, { persist = true } = {}) {
-  const bounds = getShellBounds(getCurrentChatWidth(), 340);
-  const clamped = clamp(width, bounds.min, bounds.max);
-  elements.appShell?.style.setProperty("--layout-preview-width", `${Math.round(clamped)}px`);
-  if (persist) {
-    persistLayoutValue(layoutKeys.previewWidth, clamped);
+  const desired = Math.max(0, Number(width) || 0);
+
+  if (layoutState.previewCollapsed) {
+    if (desired < layoutConfig.expandThreshold) {
+      syncShellLayout({ persist });
+      return;
+    }
+    layoutState.previewCollapsed = false;
+  } else if (desired < layoutConfig.collapseThreshold && canCollapsePanel("preview")) {
+    layoutState.previewCollapsed = true;
+    syncShellLayout({ persist });
+    return;
   }
+
+  layoutState.previewWidth = desired;
+
+  const currentChatWidth = resolveTrackWidths().chatWidth;
+  const potentialDirectoryWidth = getPotentialDirectoryWidth(currentChatWidth, layoutState.previewWidth);
+  if (layoutState.directoryCollapsed && potentialDirectoryWidth >= layoutConfig.expandThreshold) {
+    layoutState.directoryCollapsed = false;
+  } else if (!layoutState.directoryCollapsed && potentialDirectoryWidth < layoutConfig.collapseThreshold && canCollapsePanel("directory")) {
+    layoutState.directoryCollapsed = true;
+  }
+
+  syncShellLayout({ persist });
+}
+
+function collapsePanel(panel, { persist = true } = {}) {
+  if (!canCollapsePanel(panel)) {
+    return;
+  }
+  layoutState[`${panel}Collapsed`] = true;
+  syncShellLayout({ persist });
+}
+
+function expandPanel(panel, { persist = true } = {}) {
+  layoutState[`${panel}Collapsed`] = false;
+  if (panel === "chat" && !layoutState.chatWidth) {
+    layoutState.chatWidth = getDefaultChatWidth(elements.appShell?.clientWidth || window.innerWidth);
+  }
+  if (panel === "preview" && !layoutState.previewWidth) {
+    layoutState.previewWidth = getDefaultPreviewWidth(elements.appShell?.clientWidth || window.innerWidth);
+  }
+  syncShellLayout({ persist });
+}
+
+function canCollapsePanel(panel) {
+  if (layoutState[`${panel}Collapsed`]) {
+    return false;
+  }
+  return getExpandedPanelCount() > 1;
+}
+
+function getExpandedPanelCount() {
+  return ["chat", "directory", "preview"].filter((panel) => !layoutState[`${panel}Collapsed`]).length;
 }
 
 function getCurrentChatWidth() {
-  return elements.chatPanel?.getBoundingClientRect().width || getShellBounds(getCurrentPreviewWidth(), 300).preferred;
+  return resolveTrackWidths().chatWidth;
 }
 
 function getCurrentPreviewWidth() {
-  return elements.previewPanel?.getBoundingClientRect().width || getShellBounds(getCurrentChatWidth(), 340).preferred;
+  return resolveTrackWidths().previewWidth;
 }
 
-function getShellBounds(otherPanelWidth, minWidth) {
+function getPotentialDirectoryWidth(chatWidth, previewWidth) {
   const shellWidth = elements.appShell?.clientWidth || window.innerWidth;
-  const min = minWidth;
-  const centerMin = 360;
-  const splitterTotal = 28;
-  const safeOtherWidth = Number.isFinite(otherPanelWidth) && otherPanelWidth > 0 ? otherPanelWidth : shellWidth * 0.3;
-  const max = Math.max(min, shellWidth - centerMin - safeOtherWidth - splitterTotal);
-  return {
-    min,
-    max,
-    preferred: Math.min(Math.max(shellWidth * 0.29, min), max),
-  };
+  const splitTotal = layoutConfig.splitterSize * 2;
+  const nextChat = layoutState.chatCollapsed ? 0 : Math.max(0, chatWidth);
+  const nextPreview = layoutState.previewCollapsed ? 0 : Math.max(0, previewWidth);
+  return shellWidth - splitTotal - nextChat - nextPreview;
+}
+
+function updatePanelChrome({ chatWidth, directoryWidth, previewWidth }) {
+  const panels = [
+    { key: "chat", element: elements.chatPanel, width: chatWidth },
+    { key: "directory", element: elements.directoryPanel, width: directoryWidth },
+    { key: "preview", element: elements.previewPanel, width: previewWidth },
+  ];
+
+  for (const panel of panels) {
+    if (!panel.element) {
+      continue;
+    }
+    const collapsed = panel.width <= 0;
+    panel.element.classList.toggle("is-collapsed", collapsed);
+    panel.element.classList.remove("panel-leading", "panel-trailing", "panel-solo");
+    panel.element.setAttribute("aria-hidden", collapsed ? "true" : "false");
+  }
+
+  const visiblePanels = panels.filter((panel) => panel.width > 0);
+  if (visiblePanels.length === 1) {
+    visiblePanels[0].element.classList.add("panel-solo");
+  } else if (visiblePanels.length >= 2) {
+    visiblePanels[0].element.classList.add("panel-leading");
+    visiblePanels[visiblePanels.length - 1].element.classList.add("panel-trailing");
+  }
+
+  setSplitterHandleState(
+    elements.chatDirectorySplitter,
+    getSplitterRestoreTarget("chat", "directory", "chat"),
+    "调整对话区和目录区宽度"
+  );
+  setSplitterHandleState(
+    elements.directoryPreviewSplitter,
+    getSplitterRestoreTarget("directory", "preview", "preview"),
+    "调整目录区和预览区宽度"
+  );
+}
+
+function setSplitterHandleState(splitter, restorePanel, defaultLabel) {
+  if (!splitter) {
+    return;
+  }
+  const label = splitter.querySelector(".splitter-label");
+  const isCollapsedHandle = Boolean(restorePanel);
+  splitter.classList.toggle("is-collapsed-handle", isCollapsedHandle);
+  if (restorePanel) {
+    splitter.dataset.restorePanel = restorePanel;
+    splitter.setAttribute("aria-label", `展开 ${panelLabels[restorePanel]}`);
+  } else {
+    delete splitter.dataset.restorePanel;
+    splitter.setAttribute("aria-label", defaultLabel);
+  }
+  if (label) {
+    label.textContent = restorePanel ? panelLabels[restorePanel] : "";
+  }
+}
+
+function getSplitterRestoreTarget(firstPanel, secondPanel, fallbackPanel) {
+  const firstCollapsed = layoutState[`${firstPanel}Collapsed`];
+  const secondCollapsed = layoutState[`${secondPanel}Collapsed`];
+
+  if (firstCollapsed && !secondCollapsed) {
+    return firstPanel;
+  }
+  if (!firstCollapsed && secondCollapsed) {
+    return secondPanel;
+  }
+  if (firstCollapsed && secondCollapsed) {
+    return fallbackPanel;
+  }
+  return "";
+}
+
+function getDefaultChatWidth(shellWidth) {
+  return Math.round(shellWidth * 0.28);
+}
+
+function getDefaultPreviewWidth(shellWidth) {
+  return Math.round(shellWidth * 0.3);
+}
+
+function persistLayoutState() {
+  persistLayoutValue(layoutKeys.chatWidth, layoutState.chatWidth ?? getDefaultChatWidth(elements.appShell?.clientWidth || window.innerWidth));
+  persistLayoutValue(layoutKeys.previewWidth, layoutState.previewWidth ?? getDefaultPreviewWidth(elements.appShell?.clientWidth || window.innerWidth));
+  persistLayoutValue(layoutKeys.chatCollapsed, layoutState.chatCollapsed);
+  persistLayoutValue(layoutKeys.directoryCollapsed, layoutState.directoryCollapsed);
+  persistLayoutValue(layoutKeys.previewCollapsed, layoutState.previewCollapsed);
 }
 
 function persistLayoutValue(key, value) {
   try {
+    if (typeof value === "boolean") {
+      window.localStorage.setItem(key, value ? "1" : "0");
+      return;
+    }
     window.localStorage.setItem(key, String(Math.round(value)));
   } catch (error) {
     // Ignore localStorage failures and keep the layout change in memory only.
@@ -290,6 +645,18 @@ function readStoredNumber(key) {
     return Number.isFinite(parsed) ? parsed : null;
   } catch (error) {
     return null;
+  }
+}
+
+function readStoredBoolean(key, fallback = false) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) {
+      return fallback;
+    }
+    return raw === "1" || raw === "true";
+  } catch (error) {
+    return fallback;
   }
 }
 
@@ -311,6 +678,7 @@ async function loadLibrary({ preserveSelection = true } = {}) {
     state.selectedPaperId = firstPaper ? firstPaper.arxiv_id : null;
   }
 
+  syncDirectoryFocusToSelection();
   renderAppChrome();
   renderLibrary();
   if (state.selectedPaperId) {
@@ -353,6 +721,10 @@ function statCard(value, label) {
 
 function renderLibrary() {
   if (!state.library || state.library.major_topics.length === 0) {
+    elements.majorRail.innerHTML = "";
+    elements.libraryBreadcrumb.innerHTML = "";
+    elements.minorTabs.innerHTML = "";
+    elements.librarySummary.innerHTML = "";
     elements.libraryTree.innerHTML = `<div class="empty-state">当前论文库为空。提交任务后，新论文会自动落到这里。</div>`;
     return;
   }
@@ -362,11 +734,23 @@ function renderLibrary() {
     .filter(Boolean);
 
   if (topics.length === 0) {
+    elements.majorRail.innerHTML = "";
+    elements.libraryBreadcrumb.innerHTML = "";
+    elements.minorTabs.innerHTML = "";
+    elements.librarySummary.innerHTML = "";
     elements.libraryTree.innerHTML = `<div class="empty-state">没有匹配当前过滤词的目录项。</div>`;
     return;
   }
 
-  elements.libraryTree.innerHTML = topics.map(renderMajorTopic).join("");
+  const activeMajor = resolveActiveMajorTopic(topics);
+  const activeMinor = resolveActiveMinorTopic(activeMajor);
+  const visiblePapers = buildVisiblePapers(activeMajor, activeMinor);
+
+  elements.majorRail.innerHTML = renderMajorRail(topics, activeMajor.name);
+  elements.libraryBreadcrumb.innerHTML = renderBreadcrumb(activeMajor, activeMinor);
+  elements.minorTabs.innerHTML = renderMinorTabs(activeMajor, activeMinor);
+  elements.librarySummary.innerHTML = renderLibrarySummary(activeMajor, activeMinor, visiblePapers.length);
+  elements.libraryTree.innerHTML = renderPaperListView(visiblePapers);
 }
 
 function filterMajorTopic(major, filter) {
@@ -401,39 +785,131 @@ function filterMajorTopic(major, filter) {
   };
 }
 
-function renderMajorTopic(major) {
+function resolveActiveMajorTopic(topics) {
+  const matched = topics.find((major) => major.name === state.activeMajorTopic);
+  const nextMajor = matched || topics[0];
+  state.activeMajorTopic = nextMajor.name;
+  return nextMajor;
+}
+
+function resolveActiveMinorTopic(major) {
+  const availableMinorNames = new Set(major.minor_topics.map((minor) => minor.name));
+  if (state.activeMinorTopic === "__all__") {
+    return "__all__";
+  }
+  if (availableMinorNames.has(state.activeMinorTopic)) {
+    return state.activeMinorTopic;
+  }
+  const selectedLocation = findPaperLocationById(state.selectedPaperId);
+  if (selectedLocation && selectedLocation.major.name === major.name && availableMinorNames.has(selectedLocation.minor.name)) {
+    state.activeMinorTopic = selectedLocation.minor.name;
+    return state.activeMinorTopic;
+  }
+  state.activeMinorTopic = "__all__";
+  return "__all__";
+}
+
+function buildVisiblePapers(major, activeMinor) {
+  const items = [];
+  const minors = activeMinor === "__all__"
+    ? major.minor_topics
+    : major.minor_topics.filter((minor) => minor.name === activeMinor);
+
+  for (const minor of minors) {
+    for (const paper of minor.papers) {
+      items.push({ ...paper, minor_name: minor.name, major_name: major.name });
+    }
+  }
+
+  return items.sort((left, right) => {
+    const leftTime = Date.parse(left.published || "") || 0;
+    const rightTime = Date.parse(right.published || "") || 0;
+    return rightTime - leftTime;
+  });
+}
+
+function renderMajorRail(topics, activeMajorName) {
   return `
-    <details class="topic-card" open>
-      <summary class="topic-summary">
-        <div class="topic-meta">
-          <span class="topic-title">${escapeHtml(major.name)}</span>
-          <span class="muted">${escapeHtml(String(major.minor_topic_count))} subtracks</span>
-        </div>
-        <span class="topic-count">${escapeHtml(String(major.count))}</span>
-      </summary>
-      <div class="minor-list">${major.minor_topics.map(renderMinorTopic).join("")}</div>
-    </details>
+    <div class="major-rail-list">
+      ${topics.map((major) => renderMajorRailButton(major, activeMajorName)).join("")}
+    </div>
   `;
 }
 
-function renderMinorTopic(minor) {
+function renderMajorRailButton(major, activeMajorName) {
+  const activeClass = major.name === activeMajorName ? "active" : "";
   return `
-    <details class="minor-card" open>
-      <summary class="minor-summary">
-        <span class="minor-title">${escapeHtml(minor.name)}</span>
-        <span class="minor-count">${escapeHtml(String(minor.count))}</span>
-      </summary>
-      <div class="paper-list">${minor.papers.map(renderPaperButton).join("")}</div>
-    </details>
+    <button class="major-button ${activeClass}" type="button" data-major-topic="${escapeHtml(major.name)}">
+      <span class="major-button-title">${escapeHtml(major.name)}</span>
+      <span class="major-button-meta">
+        <span>${escapeHtml(String(major.minor_topic_count))} tracks</span>
+        <span>${escapeHtml(String(major.count))}</span>
+      </span>
+    </button>
   `;
 }
 
-function renderPaperButton(paper) {
+function renderBreadcrumb(major, activeMinor) {
+  const segments = [
+    `<span class="breadcrumb-segment"><span class="breadcrumb-pill">全部论文</span></span>`,
+    `<span class="breadcrumb-segment"><span>/</span><span class="breadcrumb-pill">${escapeHtml(major.name)}</span></span>`,
+  ];
+  if (activeMinor !== "__all__") {
+    segments.push(`<span class="breadcrumb-segment"><span>/</span><span class="breadcrumb-pill">${escapeHtml(activeMinor)}</span></span>`);
+  }
+  return segments.join("");
+}
+
+function renderMinorTabs(major, activeMinor) {
+  const totalCount = major.minor_topics.reduce((sum, minor) => sum + minor.papers.length, 0);
+  const items = [
+    { name: "__all__", label: "全部子方向", count: totalCount },
+    ...major.minor_topics.map((minor) => ({ name: minor.name, label: minor.name, count: minor.papers.length })),
+  ];
+  return items.map((item) => {
+    const activeClass = item.name === activeMinor ? "active" : "";
+    return `
+      <button class="minor-tab ${activeClass}" type="button" data-minor-topic="${escapeHtml(item.name)}">
+        <span>${escapeHtml(item.label)}</span>
+        <span class="minor-tab-count">${escapeHtml(String(item.count))}</span>
+      </button>
+    `;
+  }).join("");
+}
+
+function renderLibrarySummary(major, activeMinor, visibleCount) {
+  const minorLabel = activeMinor === "__all__" ? "当前查看该方向下全部论文" : `当前子方向：${activeMinor}`;
+  return `
+    <span><strong>${escapeHtml(major.name)}</strong> · ${escapeHtml(minorLabel)}</span>
+    <span>${escapeHtml(String(visibleCount))} papers</span>
+  `;
+}
+
+function renderPaperListView(papers) {
+  if (!papers.length) {
+    return `<div class="empty-state">当前方向下没有匹配论文。</div>`;
+  }
+  return `<div class="paper-list-view">${papers.map(renderPaperRow).join("")}</div>`;
+}
+
+function renderPaperRow(paper) {
   const activeClass = paper.arxiv_id === state.selectedPaperId ? "active" : "";
+  const statusClass = paper.arxiv_id === state.selectedPaperId ? "ready" : "ready";
+  const takeaway = paper.takeaway || "暂无整理摘要。";
   return `
-    <button class="paper-button ${activeClass}" type="button" data-paper-id="${escapeHtml(paper.arxiv_id)}">
-      <span class="paper-title">${escapeHtml(paper.title)}</span>
-      <span class="paper-meta"><span>${escapeHtml(formatShortDate(paper.published))}</span><span>${escapeHtml(paper.takeaway)}</span></span>
+    <button class="paper-row ${activeClass}" type="button" data-paper-id="${escapeHtml(paper.arxiv_id)}">
+      <span class="paper-row-main">
+        <span class="paper-title">${escapeHtml(paper.title)}</span>
+        <span class="paper-meta">
+          <span class="paper-row-date">${escapeHtml(formatShortDate(paper.published))}</span>
+          <span class="paper-row-track">${escapeHtml(paper.minor_name)}</span>
+        </span>
+        <span class="paper-meta">${escapeHtml(takeaway)}</span>
+      </span>
+      <span class="paper-row-status">
+        <span class="paper-status-dot ${statusClass}"></span>
+        <span class="paper-status-meta">${paper.arxiv_id === state.selectedPaperId ? "open" : "ready"}</span>
+      </span>
     </button>
   `;
 }
@@ -451,6 +927,7 @@ async function selectPaper(arxivId, { silent = false } = {}) {
   state.selectedPaperRequestId = requestId;
   state.selectedPaperId = arxivId;
   state.selectedPaper = null;
+  syncDirectoryFocusToSelection();
   if (!silent) {
     renderLibrary();
   }
@@ -514,6 +991,7 @@ function renderPaperDetail(errorText = "") {
   if (deleteButton) {
     deleteButton.addEventListener("click", () => void deletePaper(summary.arxiv_id, summary.title));
   }
+  queueMathTypeset(elements.paperDetail);
 }
 
 async function deletePaper(arxivId, title) {
@@ -549,6 +1027,7 @@ function renderMessages() {
   elements.chatFeed.querySelectorAll("[data-focus-paper]").forEach((button) => {
     button.addEventListener("click", () => void selectPaper(button.getAttribute("data-focus-paper")));
   });
+  queueMathTypeset(elements.chatFeed);
   elements.chatFeed.scrollTop = elements.chatFeed.scrollHeight;
 }
 
@@ -622,18 +1101,41 @@ function hasRenderableMarkdown(markdown) {
 }
 
 function renderStructuredPaperFallback(paper, digest) {
+  const blocks = [
+    renderFallbackParagraph("一句话概括", digest.one_sentence_takeaway),
+    renderFallbackParagraph("论文在做什么", digest.problem),
+    renderFallbackParagraph("直觉上为什么成立", digest.background),
+    renderFallbackParagraph("方法怎么理解", digest.method),
+    renderFallbackParagraph("实验怎么设置", digest.experiment_setup),
+    renderFallbackList("实验里最值得关注的点", digest.findings),
+    renderFallbackParagraph("这篇论文的价值", digest.relevance),
+    renderFallbackList("局限", digest.limitations),
+    renderFallbackList("可以怎么优化", digest.improvement_ideas),
+    renderFallbackParagraph("摘要", paper.abstract),
+  ].filter(Boolean);
+
   return `
     <div class="detail-section">
       <h4>Summary Snapshot</h4>
-      <div class="markdown-preview compact">
-        <p><strong>Takeaway:</strong> ${escapeHtml(digest.one_sentence_takeaway)}</p>
-        <p><strong>Abstract:</strong> ${escapeHtml(paper.abstract)}</p>
-        <p><strong>Method:</strong> ${escapeHtml(digest.method)}</p>
-        <p><strong>Findings:</strong> ${escapeHtml((digest.findings || []).join("；") || "暂无。")}</p>
-        <p><strong>Limitations:</strong> ${escapeHtml((digest.limitations || []).join("；") || "暂无。")}</p>
-      </div>
+      <div class="markdown-preview compact">${blocks.join("")}</div>
     </div>
   `;
+}
+
+function renderFallbackParagraph(title, text) {
+  const normalized = String(text || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  return `<p><strong>${escapeHtml(title)}:</strong> ${escapeHtml(normalized)}</p>`;
+}
+
+function renderFallbackList(title, items) {
+  const normalized = (items || []).map((item) => String(item || "").trim()).filter(Boolean);
+  if (normalized.length === 0) {
+    return "";
+  }
+  return `<div><strong>${escapeHtml(title)}:</strong><ul>${normalized.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>`;
 }
 
 function renderMarkdownPreview(markdown, options = {}) {
@@ -816,6 +1318,55 @@ function renderMarkdownLink(label, href) {
   return `<a href="${escapeHtml(safeHref)}"${target}>${safeLabel}</a>`;
 }
 
+function queueMathTypeset(root) {
+  if (!root) {
+    return;
+  }
+  mathRenderState.pendingRoots.add(root);
+  if (mathRenderState.scheduled) {
+    return;
+  }
+  mathRenderState.scheduled = true;
+  window.setTimeout(flushMathTypesetQueue, 0);
+}
+
+function flushMathTypesetQueue() {
+  mathRenderState.scheduled = false;
+  const renderMath = window.renderMathInElement;
+  if (typeof renderMath !== "function") {
+    if (mathRenderState.pendingRoots.size === 0 || mathRenderState.retryCount >= mathRenderState.maxRetries) {
+      mathRenderState.pendingRoots.clear();
+      return;
+    }
+    mathRenderState.retryCount += 1;
+    mathRenderState.scheduled = true;
+    window.setTimeout(flushMathTypesetQueue, 180);
+    return;
+  }
+
+  const roots = Array.from(mathRenderState.pendingRoots);
+  mathRenderState.pendingRoots.clear();
+  mathRenderState.retryCount = 0;
+
+  for (const root of roots) {
+    try {
+      renderMath(root, {
+        throwOnError: false,
+        strict: "ignore",
+        ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"],
+        delimiters: [
+          { left: "$$", right: "$$", display: true },
+          { left: "\\[", right: "\\]", display: true },
+          { left: "$", right: "$", display: false },
+          { left: "\\(", right: "\\)", display: false },
+        ],
+      });
+    } catch (error) {
+      // Keep the raw text when math rendering fails on malformed formulas.
+    }
+  }
+}
+
 function sanitizeMarkdownHref(href) {
   const value = String(href || "").trim();
   if (!value) {
@@ -911,19 +1462,38 @@ function firstPaperFromTree(library) {
   return null;
 }
 
-function findPaperSummaryById(arxivId) {
+function findPaperLocationById(arxivId) {
   if (!arxivId || !state.library) {
     return null;
   }
   for (const major of state.library.major_topics) {
     for (const minor of major.minor_topics) {
-      const match = minor.papers.find((paper) => paper.arxiv_id === arxivId);
-      if (match) {
-        return match;
+      const paper = minor.papers.find((item) => item.arxiv_id === arxivId);
+      if (paper) {
+        return { major, minor, paper };
       }
     }
   }
   return null;
+}
+
+function syncDirectoryFocusToSelection() {
+  const location = findPaperLocationById(state.selectedPaperId);
+  if (!location) {
+    if (!state.activeMajorTopic && state.library?.major_topics?.length) {
+      state.activeMajorTopic = state.library.major_topics[0].name;
+    }
+    if (!state.activeMinorTopic) {
+      state.activeMinorTopic = "__all__";
+    }
+    return;
+  }
+  state.activeMajorTopic = location.major.name;
+  state.activeMinorTopic = location.minor.name;
+}
+
+function findPaperSummaryById(arxivId) {
+  return findPaperLocationById(arxivId)?.paper || null;
 }
 
 async function api(path, options = {}) {

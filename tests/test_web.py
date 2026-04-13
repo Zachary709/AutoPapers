@@ -38,6 +38,8 @@ class WebServerTests(unittest.TestCase):
                 with urllib.request.urlopen(f"http://{host}:{port}/", timeout=5) as response:
                     html = response.read().decode("utf-8")
                 self.assertIn("AutoPapers Studio", html)
+                self.assertIn("katex.min.css", html)
+                self.assertIn("auto-render.min.js", html)
 
                 with urllib.request.urlopen(f"http://{host}:{port}/api/library", timeout=5) as response:
                     payload = json.loads(response.read().decode("utf-8"))

@@ -12,8 +12,9 @@ from autopapers.library import PaperLibrary
 from autopapers.llm.minimax import MiniMaxClient
 from autopapers.llm.planner import Planner
 from autopapers.models import Paper, RequestPlan, RunResult, StoredPaper
-from autopapers.pdf import PDFTextExtractor
+from autopapers.pdf import ExtractedPaperContent, PDFTextExtractor
 from autopapers.retrieval import DiscoverySearchPlanner
+from autopapers.taxonomy import TopicTaxonomy
 from autopapers.utils import (
     extract_paper_reference_text,
     extract_paper_reference_texts,
@@ -41,6 +42,7 @@ class AutoPapersAgent:
             default_max_results=settings.default_max_results,
         )
         self.discovery_search_planner = DiscoverySearchPlanner()
+        self.taxonomy = TopicTaxonomy()
         self.extractor = PDFTextExtractor(
             max_pages=settings.pdf_max_pages,
             max_chars=settings.pdf_max_chars,
@@ -78,6 +80,7 @@ class AutoPapersAgent:
 
         new_papers: list[StoredPaper] = []
         reused_papers: list[StoredPaper] = []
+        taxonomy_context = self.taxonomy.prompt_guidance()
 
         for index, paper in enumerate(candidates, start=1):
             title_label = truncate_text(paper.title, 72)
@@ -101,17 +104,23 @@ class AutoPapersAgent:
                 pdf_bytes = b""
                 emit_notice(f"PDF 下载失败，改用摘要总结：{title_label}")
 
-            extracted_text = self.extractor.extract(pdf_bytes)
-            if extracted_text:
+            extracted_content = self._extract_pdf_content(pdf_bytes)
+            if extracted_content.has_substantial_text():
                 emit_notice(f"已提取正文片段：{title_label}")
             else:
                 emit_notice(f"未提取到稳定正文，改用摘要总结：{title_label}")
             digest = self.planner.digest_paper(
                 user_request,
                 paper,
-                extracted_text,
+                extracted_content,
                 related_for_summary,
+                taxonomy_context=taxonomy_context,
                 notice_callback=notice_callback,
+            )
+            digest = self.taxonomy.canonicalize_digest(
+                paper,
+                digest,
+                [*self.library.all_records(), *new_papers, *reused_papers],
             )
             stored = self.library.upsert_paper(paper, digest, pdf_bytes, related_for_summary)
             new_papers.append(stored)
@@ -143,6 +152,96 @@ class AutoPapersAgent:
 
     def rebuild_summaries(self) -> None:
         self.library.refresh_summaries()
+
+    def reanalyze_library(
+        self,
+        *,
+        arxiv_ids: list[str] | None = None,
+        limit: int | None = None,
+        download_missing_pdf: bool = False,
+        notice_callback: Callable[[str], None] | None = None,
+    ) -> list[StoredPaper]:
+        records = self.library.all_records()
+        if arxiv_ids:
+            wanted = set(arxiv_ids)
+            records = [record for record in records if record.paper.arxiv_id in wanted]
+        records = sorted(records, key=lambda item: item.paper.published, reverse=True)
+        if limit is not None:
+            records = records[: max(0, limit)]
+
+        updated: list[StoredPaper] = []
+        taxonomy_context = self.taxonomy.prompt_guidance()
+        for index, record in enumerate(records, start=1):
+            title_label = truncate_text(record.paper.title, 72)
+            if notice_callback is not None:
+                notice_callback(f"重新分析论文 {index}/{len(records)}：{title_label}")
+            pdf_path = self.settings.repo_root / record.pdf_path
+            pdf_bytes = pdf_path.read_bytes() if pdf_path.exists() else b""
+            if not pdf_bytes and download_missing_pdf:
+                try:
+                    pdf_bytes = self.arxiv.download_pdf_bytes(record.paper)
+                    if notice_callback is not None and pdf_bytes:
+                        notice_callback(f"已补拉 PDF：{title_label}")
+                except Exception:
+                    if notice_callback is not None:
+                        notice_callback(f"缺失 PDF 且补拉失败：{title_label}")
+            extracted_content = self._extract_pdf_content(pdf_bytes)
+            related_for_summary = self.library.search(
+                f"{record.paper.title} {record.paper.primary_category}",
+                limit=3,
+                exclude_ids={record.paper.arxiv_id},
+            )
+            digest = self.planner.digest_paper(
+                f"请重新整理并深入总结这篇论文：{record.paper.title}",
+                record.paper,
+                extracted_content,
+                related_for_summary,
+                taxonomy_context=taxonomy_context,
+                notice_callback=notice_callback,
+            )
+            digest = self.taxonomy.canonicalize_digest(record.paper, digest, records)
+            updated.append(self.library.upsert_paper(record.paper, digest, pdf_bytes, related_for_summary))
+        self.library.refresh_summaries()
+        return updated
+
+    def normalize_library_topics(
+        self,
+        *,
+        notice_callback: Callable[[str], None] | None = None,
+    ) -> list[StoredPaper]:
+        records = list(self.library.all_records())
+        updated: list[StoredPaper] = []
+
+        for index, record in enumerate(records, start=1):
+            normalized_digest = self.taxonomy.canonicalize_digest(record.paper, record.digest, records)
+            if (
+                normalized_digest.major_topic == record.digest.major_topic
+                and normalized_digest.minor_topic == record.digest.minor_topic
+            ):
+                continue
+
+            title_label = truncate_text(record.paper.title, 72)
+            if notice_callback is not None:
+                notice_callback(
+                    f"规范化主题 {index}/{len(records)}：{title_label} -> {normalized_digest.major_topic} / {normalized_digest.minor_topic}"
+                )
+            pdf_path = self.settings.repo_root / record.pdf_path
+            pdf_bytes = pdf_path.read_bytes() if pdf_path.exists() else b""
+            related_for_summary = self.library.search(
+                f"{record.paper.title} {record.paper.primary_category}",
+                limit=3,
+                exclude_ids={record.paper.arxiv_id},
+            )
+            updated.append(self.library.upsert_paper(record.paper, normalized_digest, pdf_bytes, related_for_summary))
+
+        self.library.refresh_summaries()
+        return updated
+
+    def _extract_pdf_content(self, pdf_bytes: bytes) -> ExtractedPaperContent:
+        if hasattr(self.extractor, "extract_structured"):
+            return self.extractor.extract_structured(pdf_bytes)
+        extracted = self.extractor.extract(pdf_bytes)
+        return ExtractedPaperContent(raw_body=extracted)
 
     def _collect_candidates(
         self,
@@ -302,7 +401,11 @@ class AutoPapersAgent:
         lines.append(f"- Topics: {record.digest.major_topic} / {record.digest.minor_topic}")
         lines.append(f"- PDF: [{Path(record.pdf_path).name}]({record.pdf_path})")
         lines.append(f"- Takeaway: {record.digest.one_sentence_takeaway}")
-        for finding in record.digest.findings:
+        if record.digest.problem:
+            lines.append(f"- 论文在做什么: {record.digest.problem}")
+        if record.digest.experiment_setup:
+            lines.append(f"- 实验怎么设置: {truncate_text(record.digest.experiment_setup, 180)}")
+        for finding in record.digest.findings[:4]:
             lines.append(f"- Finding: {finding}")
         return lines
 
@@ -322,7 +425,7 @@ class AutoPapersAgent:
             lines.append(f"- Topic spread: {', '.join(minor_topics[:6])}")
 
         for record in records:
-            focus = record.digest.problem or record.digest.one_sentence_takeaway or record.paper.abstract
+            focus = record.digest.problem or record.digest.method or record.digest.one_sentence_takeaway or record.paper.abstract
             lines.append(f"- Focus | {record.paper.title}: {truncate_text(focus, 120)}")
 
         if len(reading_order) > 1:
