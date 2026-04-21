@@ -82,7 +82,13 @@ class WebServerTests(unittest.TestCase):
                 self.assertIn('id="settingsProfileName"', html)
                 self.assertIn('id="directorySearchToggle"', html)
                 self.assertIn('id="directorySearchPanel"', html)
+                self.assertIn('/assets/js/bootstrap.js', html)
                 self.assertNotIn("左侧切一级方向，上方切二级方向，下方像文件列表一样浏览论文。", html)
+
+                with urllib.request.urlopen(f"http://{host}:{port}/assets/js/bootstrap.js", timeout=5) as response:
+                    bootstrap_js = response.read().decode("utf-8")
+                self.assertIn('from "./api.js"', bootstrap_js)
+                self.assertIn("DOMContentLoaded", bootstrap_js)
 
                 with urllib.request.urlopen(f"http://{host}:{port}/api/library", timeout=5) as response:
                     payload = json.loads(response.read().decode("utf-8"))

@@ -1,25 +1,51 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from dataclasses import asdict
-import json
-import os
 from pathlib import Path
-import re
-import shutil
 from threading import RLock
 
+from autopapers.common.text_normalization import sanitize_path_component
 from autopapers.models import Paper, PaperDigest, StoredPaper
-from autopapers.utils import (
-    extract_paper_reference_text,
-    normalize_whitespace,
-    normalize_title_key,
-    sanitize_path_component,
-    title_similarity,
-    tokenize,
-    utc_now_iso,
-    write_bytes_atomic,
-    write_text_atomic,
+from autopapers.storage.index_store import get_index_mtime_ns, load_index, reload_index_if_changed, save_index
+from autopapers.storage.queries import (
+    all_records,
+    find_best_title_match,
+    find_by_title,
+    get_by_arxiv_id,
+    get_by_paper_id,
+    get_paper_detail,
+    list_tree,
+    search,
+    serialize_paper_summary,
+    to_repo_relative,
+    topic_snapshot,
+)
+from autopapers.storage.rendering import (
+    append_markdown_list_section,
+    append_markdown_section,
+    derive_abstract_zh,
+    format_citation_line,
+    format_venue_line,
+    neighbor_nonempty_line,
+    normalize_numbered_heading_line,
+    normalize_numbered_heading_lines,
+    ordered_list_index,
+    prepare_markdown_section_body,
+    relative_between,
+    render_major_summary,
+    render_minor_summary,
+    render_paper_markdown,
+    render_root_summary,
+    is_ordered_list_like,
+    looks_like_standalone_numbered_heading,
+)
+from autopapers.storage.writer import (
+    cleanup_previous_files,
+    delete_paper,
+    paper_stem,
+    refresh_summaries,
+    remove_stale_topic_dirs,
+    rewrite_digest,
+    upsert_paper,
 )
 
 
@@ -30,628 +56,136 @@ class PaperLibrary:
         self.index_path = self.root / "index.json"
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
-        self._records = self._load_index()
-        self._index_mtime_ns = self._get_index_mtime_ns()
+        self._records = load_index(self)
+        self._index_mtime_ns = get_index_mtime_ns(self)
 
     def get_by_paper_id(self, paper_id: str) -> StoredPaper | None:
         with self._lock:
-            self._reload_index_if_changed()
-            return self._records.get(paper_id)
+            return get_by_paper_id(self, paper_id)
 
     def get_by_arxiv_id(self, arxiv_id: str) -> StoredPaper | None:
         with self._lock:
-            self._reload_index_if_changed()
-            for record in self._records.values():
-                if record.paper.arxiv_id == arxiv_id:
-                    return record
-            return None
+            return get_by_arxiv_id(self, arxiv_id)
 
     def find_by_title(self, reference: str) -> StoredPaper | None:
         with self._lock:
-            self._reload_index_if_changed()
-            target = normalize_title_key(extract_paper_reference_text(reference))
-            if not target:
-                return None
-            for record in self._records.values():
-                if normalize_title_key(record.paper.title) == target:
-                    return record
-            return None
+            return find_by_title(self, reference)
 
     def find_best_title_match(self, reference: str, *, min_score: float = 0.72) -> StoredPaper | None:
         with self._lock:
-            self._reload_index_if_changed()
-            extracted = extract_paper_reference_text(reference)
-            target = normalize_title_key(extracted)
-            if not target:
-                return None
-
-            best_record: StoredPaper | None = None
-            best_score = 0.0
-            for record in self._records.values():
-                score = title_similarity(extracted, record.paper.title)
-                if score > best_score:
-                    best_score = score
-                    best_record = record
-            if best_record is not None and best_score >= min_score:
-                return best_record
-            return None
+            return find_best_title_match(self, reference, min_score=min_score)
 
     def all_records(self) -> list[StoredPaper]:
         with self._lock:
-            self._reload_index_if_changed()
-            return list(self._records.values())
+            return all_records(self)
 
     def search(self, query: str, *, limit: int = 5, exclude_ids: set[str] | None = None) -> list[StoredPaper]:
         with self._lock:
-            self._reload_index_if_changed()
-            query_tokens = tokenize(query)
-            if not query_tokens:
-                return []
-
-            scored: list[tuple[int, StoredPaper]] = []
-            for record in self._records.values():
-                if exclude_ids and record.paper.paper_id in exclude_ids:
-                    continue
-                title_tokens = tokenize(record.paper.title)
-                abstract_tokens = tokenize(record.paper.abstract)
-                topic_tokens = tokenize(
-                    " ".join(
-                        [
-                            record.digest.major_topic,
-                            record.digest.minor_topic,
-                            record.digest.one_sentence_takeaway,
-                            record.digest.problem,
-                            record.digest.method,
-                            record.digest.relevance,
-                            " ".join(record.digest.keywords),
-                            " ".join(record.digest.findings),
-                        ]
-                    )
-                )
-                score = 4 * len(query_tokens & title_tokens) + 2 * len(query_tokens & topic_tokens) + len(query_tokens & abstract_tokens)
-                if query.lower() in record.paper.title.lower():
-                    score += 10
-                if score > 0:
-                    scored.append((score, record))
-
-            scored.sort(key=lambda item: (-item[0], item[1].paper.published))
-            return [record for _, record in scored[:limit]]
+            return search(self, query, limit=limit, exclude_ids=exclude_ids)
 
     def topic_snapshot(self) -> str:
         with self._lock:
-            self._reload_index_if_changed()
-            if not self._records:
-                return "本地论文库为空。"
-            by_major: dict[str, list[StoredPaper]] = defaultdict(list)
-            for record in self._records.values():
-                by_major[record.digest.major_topic].append(record)
-            lines = ["本地论文库概览:"]
-            for major_topic in sorted(by_major):
-                major_records = sorted(by_major[major_topic], key=lambda item: item.paper.published, reverse=True)
-                minor_topics = sorted({record.digest.minor_topic for record in major_records})
-                lines.append(f"- {major_topic}: {len(major_records)} 篇论文, 子方向 {', '.join(minor_topics[:5])}")
-                for record in major_records[:3]:
-                    lines.append(f"  - {record.paper.title} | {record.digest.one_sentence_takeaway}")
-            return "\n".join(lines)
+            return topic_snapshot(self)
 
     def list_tree(self) -> dict:
         with self._lock:
-            self._reload_index_if_changed()
-            records = sorted(self._records.values(), key=lambda item: item.paper.published, reverse=True)
-            by_major: dict[str, dict[str, list[StoredPaper]]] = defaultdict(lambda: defaultdict(list))
-            for record in records:
-                by_major[record.digest.major_topic][record.digest.minor_topic].append(record)
-
-            major_nodes: list[dict] = []
-            minor_count = 0
-            for major_topic in sorted(by_major):
-                minor_nodes: list[dict] = []
-                for minor_topic in sorted(by_major[major_topic]):
-                    papers = [self._serialize_paper_summary(record) for record in by_major[major_topic][minor_topic]]
-                    minor_nodes.append({"name": minor_topic, "slug": sanitize_path_component(minor_topic), "count": len(papers), "papers": papers})
-                    minor_count += 1
-                major_nodes.append(
-                    {
-                        "name": major_topic,
-                        "slug": sanitize_path_component(major_topic),
-                        "count": sum(node["count"] for node in minor_nodes),
-                        "minor_topic_count": len(minor_nodes),
-                        "minor_topics": minor_nodes,
-                    }
-                )
-
-            return {
-                "updated_at": utc_now_iso(),
-                "stats": {
-                    "paper_count": len(records),
-                    "major_topic_count": len(major_nodes),
-                    "minor_topic_count": minor_count,
-                },
-                "major_topics": major_nodes,
-            }
+            return list_tree(self)
 
     def get_paper_detail(self, paper_id: str) -> dict | None:
         with self._lock:
-            self._reload_index_if_changed()
-            record = self.get_by_paper_id(paper_id)
-            if record is None:
-                return None
-            markdown_path = self.repo_root / record.md_path
-            metadata_path = self.repo_root / record.metadata_path
-            pdf_path = self.repo_root / record.pdf_path
-            markdown_content = markdown_path.read_text(encoding="utf-8") if markdown_path.exists() else ""
-            return {
-                "summary": self._serialize_paper_summary(record),
-                "paper": asdict(record.paper),
-                "digest": asdict(record.digest),
-                "stored_at": record.stored_at,
-                "paths": {"pdf": record.pdf_path, "markdown": record.md_path, "metadata": record.metadata_path},
-                "flags": {
-                    "pdf_exists": pdf_path.exists(),
-                    "markdown_exists": markdown_path.exists(),
-                    "metadata_exists": metadata_path.exists(),
-                },
-                "markdown_content": markdown_content,
-            }
+            return get_paper_detail(self, paper_id)
 
     def upsert_paper(self, paper: Paper, digest: PaperDigest, pdf_bytes: bytes, related_papers: list[StoredPaper]) -> StoredPaper:
         with self._lock:
-            major_dir = self.root / sanitize_path_component(digest.major_topic)
-            minor_dir = major_dir / sanitize_path_component(digest.minor_topic)
-            minor_dir.mkdir(parents=True, exist_ok=True)
-            stem = self._paper_stem(paper)
-            pdf_path = minor_dir / f"{stem}.pdf"
-            md_path = minor_dir / f"{stem}.md"
-            metadata_path = minor_dir / f"{stem}.metadata.json"
-
-            existing = self._records.get(paper.paper_id)
-            preserved_pdf_bytes = b""
-            if existing:
-                existing_pdf_path = self.repo_root / existing.pdf_path
-                if not pdf_bytes and existing_pdf_path.exists():
-                    preserved_pdf_bytes = existing_pdf_path.read_bytes()
-                self._cleanup_previous_files(existing, {pdf_path, md_path, metadata_path})
-
-            effective_pdf_bytes = pdf_bytes or preserved_pdf_bytes
-            if effective_pdf_bytes:
-                write_bytes_atomic(pdf_path, effective_pdf_bytes)
-
-            stored = StoredPaper(
-                paper=paper,
-                digest=digest,
-                stored_at=utc_now_iso(),
-                pdf_path=self._to_repo_relative(pdf_path),
-                md_path=self._to_repo_relative(md_path),
-                metadata_path=self._to_repo_relative(metadata_path),
-            )
-            write_text_atomic(md_path, self._render_paper_markdown(stored, related_papers), encoding="utf-8")
-            write_text_atomic(
-                metadata_path,
-                json.dumps(stored.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            self._records[paper.paper_id] = stored
-            self._save_index()
-            self.refresh_summaries()
-            return stored
+            return upsert_paper(self, paper, digest, pdf_bytes, related_papers)
 
     def rewrite_digest(self, paper_id: str, digest: PaperDigest, related_papers: list[StoredPaper], *, refresh_summaries: bool = True) -> StoredPaper:
         with self._lock:
-            self._reload_index_if_changed()
-            existing = self._records.get(paper_id)
-            if existing is None:
-                raise KeyError(f"Unknown paper_id: {paper_id}")
-            stored = StoredPaper(
-                paper=existing.paper,
-                digest=digest,
-                stored_at=existing.stored_at,
-                pdf_path=existing.pdf_path,
-                md_path=existing.md_path,
-                metadata_path=existing.metadata_path,
+            return rewrite_digest(
+                self,
+                paper_id,
+                digest,
+                related_papers,
+                refresh_summaries_enabled=refresh_summaries,
             )
-            markdown_path = self.repo_root / stored.md_path
-            metadata_path = self.repo_root / stored.metadata_path
-            write_text_atomic(markdown_path, self._render_paper_markdown(stored, related_papers), encoding="utf-8")
-            write_text_atomic(
-                metadata_path,
-                json.dumps(stored.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            self._records[paper_id] = stored
-            self._save_index()
-            if refresh_summaries:
-                self.refresh_summaries()
-            return stored
 
     def delete_paper(self, paper_id: str) -> bool:
         with self._lock:
-            existing = self._records.pop(paper_id, None)
-            if existing is None:
-                return False
-            for relative_path in (existing.pdf_path, existing.md_path, existing.metadata_path):
-                absolute = self.repo_root / relative_path
-                if absolute.exists() and self.root in absolute.parents:
-                    absolute.unlink()
-            self._save_index()
-            self.refresh_summaries()
-            return True
+            return delete_paper(self, paper_id)
 
     def refresh_summaries(self) -> None:
         with self._lock:
-            self.root.mkdir(parents=True, exist_ok=True)
-            records = sorted(self._records.values(), key=lambda item: item.paper.published, reverse=True)
-            by_major: dict[str, list[StoredPaper]] = defaultdict(list)
-            by_minor: dict[tuple[str, str], list[StoredPaper]] = defaultdict(list)
-            for record in records:
-                by_major[record.digest.major_topic].append(record)
-                by_minor[(record.digest.major_topic, record.digest.minor_topic)].append(record)
-
-            active_major_dirs = {self.root / sanitize_path_component(major_topic) for major_topic in by_major}
-            active_minor_dirs = {
-                self.root / sanitize_path_component(major_topic) / sanitize_path_component(minor_topic)
-                for (major_topic, minor_topic) in by_minor
-            }
-            self._remove_stale_topic_dirs(active_major_dirs, active_minor_dirs)
-            write_text_atomic(self.root / "README.md", self._render_root_summary(records), encoding="utf-8")
-
-            for major_topic, major_records in by_major.items():
-                major_dir = self.root / sanitize_path_component(major_topic)
-                major_dir.mkdir(parents=True, exist_ok=True)
-                write_text_atomic(
-                    major_dir / "README.md",
-                    self._render_major_summary(major_topic, major_records),
-                    encoding="utf-8",
-                )
-
-            for (major_topic, minor_topic), minor_records in by_minor.items():
-                minor_dir = self.root / sanitize_path_component(major_topic) / sanitize_path_component(minor_topic)
-                minor_dir.mkdir(parents=True, exist_ok=True)
-                write_text_atomic(
-                    minor_dir / "README.md",
-                    self._render_minor_summary(major_topic, minor_topic, minor_records),
-                    encoding="utf-8",
-                )
+            refresh_summaries(self)
 
     def _load_index(self) -> dict[str, StoredPaper]:
-        if not self.index_path.exists():
-            return {}
-        try:
-            data = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return {}
-        papers = data.get("papers", [])
-        records: dict[str, StoredPaper] = {}
-        for record_data in papers:
-            stored = StoredPaper.from_dict(record_data)
-            records[stored.paper.paper_id] = stored
-        return records
+        return load_index(self)
 
     def _save_index(self) -> None:
-        payload = {"updated_at": utc_now_iso(), "papers": [record.to_dict() for record in sorted(self._records.values(), key=lambda item: item.paper.paper_id)]}
-        write_text_atomic(self.index_path, json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._index_mtime_ns = self._get_index_mtime_ns()
+        save_index(self)
 
     def _reload_index_if_changed(self) -> None:
-        current_mtime_ns = self._get_index_mtime_ns()
-        if current_mtime_ns == self._index_mtime_ns:
-            return
-        self._records = self._load_index()
-        self._index_mtime_ns = current_mtime_ns
+        reload_index_if_changed(self)
 
     def _get_index_mtime_ns(self) -> int | None:
-        if not self.index_path.exists():
-            return None
-        return self.index_path.stat().st_mtime_ns
+        return get_index_mtime_ns(self)
 
     def _paper_stem(self, paper: Paper) -> str:
-        title_slug = sanitize_path_component(paper.title, max_length=60)
-        return sanitize_path_component(f"{paper.paper_id}_{title_slug}", max_length=96)
+        return paper_stem(paper)
 
     def _cleanup_previous_files(self, existing: StoredPaper, keep: set[Path]) -> None:
-        for relative_path in (existing.pdf_path, existing.md_path, existing.metadata_path):
-            absolute = self.repo_root / relative_path
-            if absolute in keep:
-                continue
-            if absolute.exists() and self.root in absolute.parents:
-                absolute.unlink()
+        cleanup_previous_files(self, existing, keep)
 
     def _remove_stale_topic_dirs(self, active_major_dirs: set[Path], active_minor_dirs: set[Path]) -> None:
-        for child in self.root.iterdir():
-            if child.is_dir() and child not in active_major_dirs:
-                shutil.rmtree(child, ignore_errors=True)
-        for major_dir in active_major_dirs:
-            if not major_dir.exists():
-                continue
-            for child in major_dir.iterdir():
-                if child.is_dir() and child not in active_minor_dirs:
-                    shutil.rmtree(child, ignore_errors=True)
+        remove_stale_topic_dirs(self, active_major_dirs, active_minor_dirs)
 
     def _serialize_paper_summary(self, record: StoredPaper) -> dict:
-        pdf_path = self.repo_root / record.pdf_path
-        return {
-            "paper_id": record.paper.paper_id,
-            "arxiv_id": record.paper.arxiv_id,
-            "versioned_id": record.paper.versioned_id,
-            "source_primary": record.paper.source_primary,
-            "title": record.paper.title,
-            "published": record.paper.published,
-            "stored_at": record.stored_at,
-            "authors": record.paper.authors,
-            "major_topic": record.digest.major_topic,
-            "minor_topic": record.digest.minor_topic,
-            "takeaway": record.digest.one_sentence_takeaway,
-            "keywords": record.digest.keywords,
-            "pdf_available": pdf_path.exists(),
-            "venue": {
-                "name": record.paper.venue.name,
-                "kind": record.paper.venue.kind,
-                "year": record.paper.venue.year,
-            },
-            "citation_count": record.paper.citation_count,
-            "citation_updated_at": record.paper.citation_updated_at,
-            "links": {
-                "entry": record.paper.entry_url or record.paper.entry_id,
-                "scholar": record.paper.scholar_url,
-                "openreview": record.paper.openreview_url,
-            },
-        }
+        return serialize_paper_summary(self, record)
 
     def _to_repo_relative(self, path: Path) -> str:
-        return path.relative_to(self.repo_root).as_posix()
+        return to_repo_relative(self, path)
 
     def _render_paper_markdown(self, stored: StoredPaper, related_papers: list[StoredPaper]) -> str:
-        md_file_path = self.repo_root / stored.md_path
-        note_dir = md_file_path.parent
-        pdf_absolute = self.repo_root / stored.pdf_path
-        pdf_link = ""
-        if pdf_absolute.exists():
-            pdf_relative = Path(stored.pdf_path).name
-            pdf_link = f"[{Path(pdf_relative).name}]({pdf_relative})"
+        return render_paper_markdown(self, stored, related_papers)
 
-        related_lines = []
-        for record in related_papers[:5]:
-            target_path = self.repo_root / record.md_path
-            link_target = self._relative_between(note_dir, target_path)
-            related_lines.append(f"- [{record.paper.title}]({link_target}) | {record.digest.one_sentence_takeaway}")
-        if not related_lines:
-            related_lines.append("- 暂无。")
+    @staticmethod
+    def _render_root_summary(records: list[StoredPaper]) -> str:
+        return render_root_summary(records)
 
-        keywords = ", ".join(stored.digest.keywords)
-        abstract_zh = self._derive_abstract_zh(stored)
-        identity_lines = [
-            f"- Paper ID: `{stored.paper.paper_id}`",
-            f"- Source: {stored.paper.source_primary}",
-        ]
-        if stored.paper.arxiv_id:
-            identity_lines.append(f"- arXiv ID: `{stored.paper.versioned_id or stored.paper.arxiv_id}`")
+    @staticmethod
+    def _render_major_summary(major_topic: str, records: list[StoredPaper]) -> str:
+        return render_major_summary(major_topic, records)
 
-        publication_lines = [f"- Published: {stored.paper.published}"]
-        if stored.paper.venue.name:
-            publication_lines.append(f"- Venue: {self._format_venue_line(stored.paper)}")
-        if stored.paper.citation_count is not None:
-            publication_lines.append(f"- Citations: {self._format_citation_line(stored.paper)}")
-
-        research_lines = [f"- Authors: {', '.join(stored.paper.authors)}"]
-        research_lines.append(f"- Topics: {stored.digest.major_topic} / {stored.digest.minor_topic}")
-        if keywords:
-            research_lines.append(f"- Keywords: {keywords}")
-
-        access_lines: list[str] = []
-        if pdf_link:
-            access_lines.append(f"- PDF: {pdf_link}")
-        if stored.paper.entry_url or stored.paper.entry_id:
-            access_lines.append(f"- Entry: {stored.paper.entry_url or stored.paper.entry_id}")
-        if stored.paper.openreview_url:
-            access_lines.append(f"- OpenReview: {stored.paper.openreview_url}")
-        if stored.paper.scholar_url:
-            access_lines.append(f"- Google Scholar: {stored.paper.scholar_url}")
-
-        lines = [
-            f"# {stored.paper.title}",
-            "",
-            "## Paper Snapshot",
-            "",
-            "### Identity",
-            "",
-            *identity_lines,
-            "",
-            "### Publication",
-            "",
-            *publication_lines,
-            "",
-            "### Research Context",
-            "",
-            *research_lines,
-            "",
-        ]
-        if access_lines:
-            lines.extend([
-                "### Access",
-                "",
-                *access_lines,
-                "",
-            ])
-        lines.extend([
-            "## 中文摘要",
-            "",
-            abstract_zh or "暂无中文摘要。",
-            "",
-            "## English Abstract",
-            "",
-            stored.paper.abstract,
-            "",
-        ])
-        self._append_markdown_section(lines, "一句话概括", stored.digest.one_sentence_takeaway)
-        self._append_markdown_section(lines, "论文在做什么", stored.digest.problem)
-        self._append_markdown_section(lines, "直觉上为什么成立", stored.digest.background)
-        self._append_markdown_section(lines, "方法怎么理解", stored.digest.method)
-        self._append_markdown_section(lines, "实验怎么设置", stored.digest.experiment_setup)
-        self._append_markdown_list_section(lines, "实验里最值得关注的点", stored.digest.findings)
-        self._append_markdown_section(lines, "这篇论文的价值", stored.digest.relevance)
-        self._append_markdown_list_section(lines, "局限", stored.digest.limitations)
-        self._append_markdown_list_section(lines, "可以怎么优化", stored.digest.improvement_ideas)
-        lines.append("## Related Local Papers")
-        lines.append("")
-        lines.extend(related_lines)
-        lines.append("")
-        return "\n".join(lines)
-
-    def _render_root_summary(self, records: list[StoredPaper]) -> str:
-        lines = ["# AutoPapers Library", ""]
-        lines.append(f"- Updated at: {utc_now_iso()}")
-        lines.append(f"- Total papers: {len(records)}")
-        lines.append("")
-        if not records:
-            lines.append("Library is currently empty.")
-            return "\n".join(lines) + "\n"
-        by_major: dict[str, list[StoredPaper]] = defaultdict(list)
-        for record in records:
-            by_major[record.digest.major_topic].append(record)
-        lines.append("## Major Topics")
-        lines.append("")
-        for major_topic in sorted(by_major):
-            major_dir = sanitize_path_component(major_topic)
-            minor_count = len({record.digest.minor_topic for record in by_major[major_topic]})
-            lines.append(f"- [{major_topic}](./{major_dir}/README.md): {len(by_major[major_topic])} papers, {minor_count} minor topics")
-        lines.append("")
-        return "\n".join(lines)
-
-    def _render_major_summary(self, major_topic: str, records: list[StoredPaper]) -> str:
-        lines = [f"# {major_topic}", ""]
-        lines.append(f"- Total papers: {len(records)}")
-        lines.append(f"- Minor topics: {len({record.digest.minor_topic for record in records})}")
-        lines.append("")
-        lines.append("## Minor Topics")
-        lines.append("")
-        by_minor: dict[str, list[StoredPaper]] = defaultdict(list)
-        for record in records:
-            by_minor[record.digest.minor_topic].append(record)
-        for minor_topic in sorted(by_minor):
-            minor_dir = sanitize_path_component(minor_topic)
-            lines.append(f"- [{minor_topic}](./{minor_dir}/README.md): {len(by_minor[minor_topic])} papers")
-        lines.append("")
-        lines.append("## Representative Papers")
-        lines.append("")
-        for record in records[:8]:
-            minor_dir = sanitize_path_component(record.digest.minor_topic)
-            md_name = Path(record.md_path).name
-            lines.append(f"- [{record.paper.title}](./{minor_dir}/{md_name}): {record.digest.one_sentence_takeaway}")
-        lines.append("")
-        return "\n".join(lines)
-
-    def _render_minor_summary(self, major_topic: str, minor_topic: str, records: list[StoredPaper]) -> str:
-        keyword_counter = Counter()
-        for record in records:
-            keyword_counter.update(record.digest.keywords)
-        lines = [f"# {major_topic} / {minor_topic}", ""]
-        lines.append(f"- Total papers: {len(records)}")
-        if keyword_counter:
-            lines.append(f"- Frequent keywords: {', '.join(keyword for keyword, _ in keyword_counter.most_common(10))}")
-        lines.append("")
-        lines.append("## Papers")
-        lines.append("")
-        for record in records:
-            relative_name = Path(record.md_path).name
-            lines.append(f"### [{record.paper.title}](./{relative_name})")
-            lines.append(f"- Source: {record.paper.source_primary}")
-            if record.paper.arxiv_id:
-                lines.append(f"- arXiv: `{record.paper.versioned_id or record.paper.arxiv_id}`")
-            lines.append(f"- Published: {record.paper.published}")
-            lines.append(f"- Venue: {self._format_venue_line(record.paper)}")
-            lines.append(f"- Citations: {self._format_citation_line(record.paper)}")
-            lines.append(f"- Takeaway: {record.digest.one_sentence_takeaway}")
-            lines.append("")
-        return "\n".join(lines)
+    @staticmethod
+    def _render_minor_summary(major_topic: str, minor_topic: str, records: list[StoredPaper]) -> str:
+        return render_minor_summary(major_topic, minor_topic, records)
 
     @staticmethod
     def _format_venue_line(paper: Paper) -> str:
-        if paper.venue.name:
-            year = f" ({paper.venue.year})" if paper.venue.year else ""
-            kind = f" [{paper.venue.kind}]" if paper.venue.kind else ""
-            return f"{paper.venue.name}{year}{kind}"
-        return "unavailable"
+        return format_venue_line(paper)
 
     @staticmethod
     def _format_citation_line(paper: Paper) -> str:
-        if paper.citation_count is None:
-            return "unavailable"
-        updated = f" | updated {paper.citation_updated_at}" if paper.citation_updated_at else ""
-        source = f" | source {paper.citation_source}" if paper.citation_source else ""
-        return f"{paper.citation_count}{source}{updated}"
+        return format_citation_line(paper)
 
     @staticmethod
     def _derive_abstract_zh(stored: StoredPaper) -> str:
-        if normalize_whitespace(stored.digest.abstract_zh):
-            return normalize_whitespace(stored.digest.abstract_zh)
-        if normalize_whitespace(stored.paper.abstract) and re.search(r"[\u4e00-\u9fff]", stored.paper.abstract):
-            return normalize_whitespace(stored.paper.abstract)
-        return ""
+        return derive_abstract_zh(stored)
 
     @staticmethod
     def _relative_between(from_dir: Path, to_path: Path) -> str:
-        return Path(os.path.relpath(to_path, start=from_dir)).as_posix()
+        return relative_between(from_dir, to_path)
 
     @staticmethod
     def _prepare_markdown_section_body(body: str) -> str:
-        raw = str(body or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-        if not raw:
-            return ""
-        text = raw
-        text = re.sub(r"\s*(\$\$.*?\$\$)\s*", r"\n\n\1\n\n", text, flags=re.S)
-        text = re.sub(r"(?<!^)(?=【[^】]+】)", "\n\n", text)
-        text = re.sub(r"([：:])\s+(?=(?:\d+\.\s+\*\*|\d+\.\s+|[-*]\s+\*\*))", r"\1\n\n", text)
-        text = re.sub(r"\s+(?=(?:\d+\.\s+\*\*|\d+\.\s+[\u4e00-\u9fffA-Za-z]|[-*]\s+\*\*))", "\n\n", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        lines = []
-        for line in text.split("\n"):
-            normalized = normalize_whitespace(line) if line.strip() else ""
-            if normalized in {"#", "##", "###", "####"}:
-                normalized = ""
-            lines.append(normalized)
-        lines = PaperLibrary._normalize_numbered_heading_lines(lines)
-        cleaned: list[str] = []
-        blank_run = 0
-        for line in lines:
-            if not line:
-                blank_run += 1
-                if blank_run <= 2 and cleaned:
-                    cleaned.append("")
-                continue
-            blank_run = 0
-            cleaned.append(line)
-        while cleaned and not cleaned[-1]:
-            cleaned.pop()
-        return "\n".join(cleaned).strip()
+        return prepare_markdown_section_body(body)
 
     @staticmethod
     def _normalize_numbered_heading_lines(lines: list[str]) -> list[str]:
-        normalized_lines: list[str] = []
-        for index, line in enumerate(lines):
-            if not line:
-                normalized_lines.append(line)
-                continue
-            previous_index, previous_nonempty = PaperLibrary._neighbor_nonempty_line(lines, index, step=-1)
-            next_index, next_nonempty = PaperLibrary._neighbor_nonempty_line(lines, index, step=1)
-            normalized_lines.append(
-                PaperLibrary._normalize_numbered_heading_line(
-                    line,
-                    previous_nonempty=previous_nonempty,
-                    next_nonempty=next_nonempty,
-                    previous_gap=(index - previous_index - 1) if previous_index is not None else 0,
-                    next_gap=(next_index - index - 1) if next_index is not None else 0,
-                )
-            )
-        return normalized_lines
+        return normalize_numbered_heading_lines(lines)
 
     @staticmethod
     def _neighbor_nonempty_line(lines: list[str], index: int, *, step: int) -> tuple[int | None, str]:
-        cursor = index + step
-        while 0 <= cursor < len(lines):
-            candidate = lines[cursor].strip()
-            if candidate:
-                return cursor, candidate
-            cursor += step
-        return None, ""
+        return neighbor_nonempty_line(lines, index, step=step)
 
     @staticmethod
     def _normalize_numbered_heading_line(
@@ -662,50 +196,13 @@ class PaperLibrary:
         previous_gap: int,
         next_gap: int,
     ) -> str:
-        explicit_heading = re.match(r"^(#{1,6})\s+((?:\d+\.)+\d+|\d+\.)\s+(.+)$", line)
-        if explicit_heading:
-            return f"{explicit_heading.group(1)} {explicit_heading.group(3).strip()}"
-
-        multilevel_match = re.match(r"^((?:\d+\.)+\d+)\s+(.+)$", line)
-        if multilevel_match:
-            title = multilevel_match.group(2).strip()
-            if PaperLibrary._looks_like_standalone_numbered_heading(
-                title,
-                previous_nonempty=previous_nonempty,
-                next_nonempty=next_nonempty,
-                previous_gap=previous_gap,
-                next_gap=next_gap,
-            ):
-                level = min(6, 2 + len(multilevel_match.group(1).split(".")))
-                return f"{'#' * level} {title}"
-
-        single_level_match = re.match(r"^(\d+)\.\s+(.+)$", line)
-        if single_level_match:
-            title = single_level_match.group(2).strip()
-            if PaperLibrary._looks_like_standalone_numbered_heading(
-                title,
-                previous_nonempty=previous_nonempty,
-                next_nonempty=next_nonempty,
-                previous_gap=previous_gap,
-                next_gap=next_gap,
-            ):
-                return f"### {title}"
-            previous_ordered_index = PaperLibrary._ordered_list_index(previous_nonempty)
-            if (
-                previous_gap > 0
-                and previous_ordered_index is not None
-                and PaperLibrary._ordered_list_index(next_nonempty) is None
-                and int(single_level_match.group(1)) <= previous_ordered_index
-                and PaperLibrary._looks_like_standalone_numbered_heading(
-                    title,
-                    previous_nonempty="",
-                    next_nonempty=next_nonempty,
-                    previous_gap=0,
-                    next_gap=next_gap,
-                )
-            ):
-                return f"### {title}"
-        return line
+        return normalize_numbered_heading_line(
+            line,
+            previous_nonempty=previous_nonempty,
+            next_nonempty=next_nonempty,
+            previous_gap=previous_gap,
+            next_gap=next_gap,
+        )
 
     @staticmethod
     def _looks_like_standalone_numbered_heading(
@@ -716,48 +213,30 @@ class PaperLibrary:
         previous_gap: int,
         next_gap: int,
     ) -> bool:
-        normalized = normalize_whitespace(title)
-        if not normalized:
-            return False
-        if len(normalized) > 48:
-            return False
-        if any(token in normalized for token in ("**", "$$", "$", "`")):
-            return False
-        if re.search(r"[。！？!?；;]$", normalized):
-            return False
-        if re.search(r"[：:].{18,}$", normalized):
-            return False
-        if previous_gap == 0 and PaperLibrary._is_ordered_list_like(previous_nonempty):
-            return False
-        if next_gap == 0 and PaperLibrary._is_ordered_list_like(next_nonempty):
-            return False
-        if PaperLibrary._is_ordered_list_like(previous_nonempty) or PaperLibrary._is_ordered_list_like(next_nonempty):
-            return False
-        return True
+        return looks_like_standalone_numbered_heading(
+            title,
+            previous_nonempty=previous_nonempty,
+            next_nonempty=next_nonempty,
+            previous_gap=previous_gap,
+            next_gap=next_gap,
+        )
 
     @staticmethod
     def _is_ordered_list_like(line: str) -> bool:
-        return bool(re.match(r"^\d+\.\s+.+$", line))
+        return is_ordered_list_like(line)
 
     @staticmethod
     def _ordered_list_index(line: str) -> int | None:
-        match = re.match(r"^(\d+)\.\s+.+$", line)
-        if not match:
-            return None
-        return int(match.group(1))
+        return ordered_list_index(line)
 
     @staticmethod
     def _append_markdown_section(lines: list[str], title: str, body: str) -> None:
-        formatted = PaperLibrary._prepare_markdown_section_body(body)
-        if not formatted:
-            return
-        lines.extend([f"## {title}", "", formatted, ""])
+        append_markdown_section(lines, title, body)
 
     @staticmethod
     def _append_markdown_list_section(lines: list[str], title: str, items: list[str]) -> None:
-        normalized_items = [normalize_whitespace(item) for item in items if normalize_whitespace(item)]
-        if not normalized_items:
-            return
-        lines.extend([f"## {title}", ""])
-        lines.extend(f"- {item}" for item in normalized_items)
-        lines.append("")
+        append_markdown_list_section(lines, title, items)
+
+    @staticmethod
+    def _sanitize_path_component(value: str, max_length: int = 80) -> str:
+        return sanitize_path_component(value, max_length=max_length)
