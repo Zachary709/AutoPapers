@@ -22,6 +22,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Attempt to download the PDF when the local copy is missing",
     )
+    parser.add_argument(
+        "--format-only",
+        action="store_true",
+        help="Only run the final format-tightening step on existing digests",
+    )
     return parser
 
 
@@ -38,9 +43,11 @@ def main(argv: list[str] | None = None) -> int:
         arxiv_ids=args.arxiv_id,
         limit=args.limit,
         download_missing_pdf=args.download_missing_pdf,
+        format_only=args.format_only,
         notice_callback=print,
     )
-    print(f"Re-analyzed {len(updated)} paper(s).")
+    action = "Format-updated" if args.format_only else "Re-analyzed"
+    print(f"{action} {len(updated)} paper(s).")
     return 0
 
 

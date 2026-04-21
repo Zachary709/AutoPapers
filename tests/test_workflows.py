@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from urllib.error import HTTPError
+from unittest.mock import patch
 
 from autopapers.library import PaperLibrary
-from autopapers.models import Paper, PaperDigest, RequestPlan, RunResult
+from autopapers.models import Paper, PaperDigest, RequestPlan, RunResult, TaskCancelledError
 from autopapers.pdf import ExtractedPaperContent
 from autopapers.retrieval import SearchSpec
 from autopapers.taxonomy import TopicTaxonomy
@@ -14,6 +16,8 @@ from autopapers.workflows import AutoPapersAgent
 
 def make_paper(identifier: str, title: str) -> Paper:
     return Paper(
+        paper_id=identifier,
+        source_primary="arxiv",
         arxiv_id=identifier,
         versioned_id=f"{identifier}v1",
         title=title,
@@ -22,6 +26,7 @@ def make_paper(identifier: str, title: str) -> Paper:
         published="2026-01-01T00:00:00Z",
         updated="2026-01-02T00:00:00Z",
         entry_id=f"http://arxiv.org/abs/{identifier}v1",
+        entry_url=f"http://arxiv.org/abs/{identifier}v1",
         pdf_url=f"http://arxiv.org/pdf/{identifier}v1",
         primary_category="cs.CL",
         categories=["cs.CL"],
@@ -73,6 +78,32 @@ class FakeArxivClient:
         return b"%PDF-1.4 fake content"
 
 
+class FakeSourceClient(FakeArxivClient):
+    def enrich_metadata(self, paper: Paper) -> Paper:
+        return paper
+
+
+class FakeMetadataClient:
+    def __init__(self, updated_paper: Paper | None = None) -> None:
+        self.updated_paper = updated_paper
+
+    def enrich_metadata(self, paper: Paper) -> Paper:
+        return self.updated_paper or paper
+
+
+class SuccessfulResolver:
+    def __init__(self, paper: Paper) -> None:
+        self.paper = paper
+
+    def resolve_reference(self, reference: str) -> Paper:
+        return self.paper
+
+
+class ForbiddenResolver:
+    def resolve_reference(self, reference: str) -> Paper:
+        raise HTTPError("https://api2.openreview.net/notes/search", 403, "Forbidden", hdrs=None, fp=None)
+
+
 class FakeDiscoverySearchPlanner:
     def __init__(self, specs: list[SearchSpec]) -> None:
         self.specs = specs
@@ -85,6 +116,7 @@ class FakePlanner:
     def __init__(self, plan: RequestPlan) -> None:
         self.plan = plan
         self.last_extracted_text = None
+        self.format_only_calls: list[str] = []
 
     def plan_request(self, *args, **kwargs) -> RequestPlan:
         return self.plan
@@ -93,6 +125,10 @@ class FakePlanner:
         if len(args) >= 3:
             self.last_extracted_text = args[2]
         return make_digest()
+
+    def tighten_digest_format_only(self, paper: Paper, digest: PaperDigest, *, notice_callback=None) -> PaperDigest:
+        self.format_only_calls.append(paper.paper_id)
+        return digest
 
 
 class FakeExtractor:
@@ -152,6 +188,25 @@ class WorkflowDiscoveryTests(unittest.TestCase):
             ],
         )
 
+    def test_save_report_replaces_stale_tmp_file_atomically(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            agent = AutoPapersAgent.__new__(AutoPapersAgent)
+            agent.settings = FakeSettings(root)
+
+            with patch("autopapers.workflows.datetime") as mock_datetime:
+                mock_datetime.now.return_value.strftime.return_value = "20260421-123456"
+                relative_path = agent._save_report("Atomic Report", "first version")
+                report_path = root / relative_path
+                tmp_path = report_path.with_name(f"{report_path.name}.tmp")
+                tmp_path.write_text("partial report", encoding="utf-8")
+
+                relative_path = agent._save_report("Atomic Report", "second version")
+                report_path = root / relative_path
+
+            self.assertEqual(report_path.read_text(encoding="utf-8"), "second version")
+            self.assertFalse(tmp_path.exists())
+
     def test_collect_candidates_stops_after_enough_results(self) -> None:
         first_query = "all:uncertainty"
         second_query = "all:llm"
@@ -186,6 +241,46 @@ class WorkflowDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(len(papers), 2)
         self.assertEqual(len(agent.arxiv.calls), 1)
+
+    def test_collect_candidates_combines_arxiv_openreview_and_scholar_fallback(self) -> None:
+        query = "test-time scaling"
+        agent = AutoPapersAgent.__new__(AutoPapersAgent)
+        agent.arxiv = FakeArxivClient({query: [make_paper("2401.12345", "Paper A")]})
+        openreview_paper = make_paper("2401.12346", "Paper B")
+        openreview_paper.paper_id = "openreview:forum-b"
+        openreview_paper.source_primary = "openreview"
+        openreview_paper.arxiv_id = ""
+        openreview_paper.versioned_id = ""
+        openreview_paper.openreview_id = "note-b"
+        openreview_paper.openreview_forum_id = "forum-b"
+        openreview_paper.entry_url = "https://openreview.net/forum?id=forum-b"
+        openreview_paper.entry_id = openreview_paper.entry_url
+        openreview_paper.pdf_url = "https://openreview.net/pdf?id=forum-b"
+        agent.openreview = FakeSourceClient({query: [openreview_paper]})
+        scholar_paper = make_paper("2401.12347", "Paper C")
+        scholar_paper.paper_id = "scholar:paper-c"
+        scholar_paper.source_primary = "scholar"
+        scholar_paper.arxiv_id = ""
+        scholar_paper.versioned_id = ""
+        scholar_paper.entry_url = "https://example.com/paper-c"
+        scholar_paper.entry_id = scholar_paper.entry_url
+        agent.scholar = FakeSourceClient({query: [scholar_paper]})
+        agent.discovery_search_planner = FakeDiscoverySearchPlanner([SearchSpec(query=query, field="all")])
+        agent.taxonomy = TopicTaxonomy()
+        plan = RequestPlan(
+            intent="discover_papers",
+            user_goal="找论文",
+            search_query=query,
+            paper_refs=[],
+            max_results=3,
+            reuse_local=True,
+            rationale="",
+        )
+
+        papers = agent._collect_candidates(plan, query)
+
+        self.assertEqual(len(papers), 3)
+        self.assertEqual([paper.paper_id for paper in papers], ["2401.12345", "openreview:forum-b", "scholar:paper-c"])
 
     def test_collect_candidates_for_explain_paper_prefers_local_library_match(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -282,6 +377,66 @@ class WorkflowDiscoveryTests(unittest.TestCase):
                 agent._collect_candidates(plan, "详细介绍 Missing Verification Survey")
 
             self.assertEqual(agent.arxiv.resolved_references, ["Missing Verification Survey"])
+
+    def test_collect_candidates_for_explain_paper_continues_after_openreview_403(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            library = PaperLibrary(root / "library")
+            expected = make_paper("2604.00001", "CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning")
+            agent = AutoPapersAgent.__new__(AutoPapersAgent)
+            agent.library = library
+            agent.arxiv = FakeArxivClient({})
+            agent.openreview = ForbiddenResolver()
+            agent.scholar = SuccessfulResolver(expected)
+            agent.taxonomy = TopicTaxonomy()
+
+            plan = RequestPlan(
+                intent="explain_paper",
+                user_goal="找论文",
+                search_query="",
+                paper_refs=["CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning"],
+                max_results=1,
+                reuse_local=True,
+                rationale="",
+            )
+            notices: list[str] = []
+
+            papers = agent._collect_candidates(plan, plan.paper_refs[0], notice_callback=notices.append)
+
+            self.assertEqual([paper.paper_id for paper in papers], [expected.paper_id])
+            self.assertTrue(any("OpenReview 解析失败" in notice for notice in notices))
+
+    def test_collect_candidates_requests_confirmation_for_low_similarity_match(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            library = PaperLibrary(root / "library")
+            mismatched = make_paper("2604.00002", "A Totally Different Reasoning Paper")
+            agent = AutoPapersAgent.__new__(AutoPapersAgent)
+            agent.library = library
+            agent.arxiv = FakeArxivClient({})
+            agent.scholar = SuccessfulResolver(mismatched)
+            agent.taxonomy = TopicTaxonomy()
+
+            plan = RequestPlan(
+                intent="explain_paper",
+                user_goal="找论文",
+                search_query="",
+                paper_refs=["CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning"],
+                max_results=1,
+                reuse_local=True,
+                rationale="",
+            )
+            prompts: list[dict[str, object]] = []
+
+            with self.assertRaisesRegex(TaskCancelledError, "用户拒绝保存和解析低相似度候选论文"):
+                agent._collect_candidates(
+                    plan,
+                    plan.paper_refs[0],
+                    confirmation_callback=lambda payload: prompts.append(payload) or False,
+                )
+
+            self.assertEqual(len(prompts), 1)
+            self.assertEqual(prompts[0]["source"], "Google Scholar")
 
     def test_run_uses_clean_reference_for_related_local_search(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -403,22 +558,208 @@ class WorkflowDiscoveryTests(unittest.TestCase):
             agent.extractor = FakeExtractor(ExtractedPaperContent(method="Method body for notice test."))
             agent.taxonomy = TopicTaxonomy()
 
-            notices: list[str] = []
-            result = agent.run("帮我找一篇论文", notice_callback=notices.append)
+            timeline: list[dict[str, object]] = []
+            progress_updates: list[dict[str, object]] = []
+            result = agent.run(
+                "帮我找一篇论文",
+                timeline_callback=timeline.append,
+                progress_callback=progress_updates.append,
+            )
 
             self.assertIsInstance(result, RunResult)
-            joined = "\n".join(notices)
-            self.assertIn("开始任务规划", joined)
-            self.assertIn("规划完成：discover_papers", joined)
-            self.assertIn("开始检索 arXiv 候选论文", joined)
-            self.assertIn("检索 arXiv 第 1 轮", joined)
-            self.assertIn("处理论文 1/1", joined)
-            self.assertIn("已下载 PDF", joined)
-            self.assertIn("已提取正文片段", joined)
-            self.assertIn("已写入本地库", joined)
-            self.assertIn("任务完成，报告已保存", joined)
+            timeline_messages = "\n".join(str(item["message"]) for item in timeline)
+            self.assertIn("开始任务规划", timeline_messages)
+            self.assertIn("规划完成：discover_papers", timeline_messages)
+            self.assertIn("开始检索多源候选论文", timeline_messages)
+            self.assertIn("开始处理论文：1 篇", timeline_messages)
+            self.assertIn("正在生成报告", timeline_messages)
             self.assertIsInstance(agent.planner.last_extracted_text, ExtractedPaperContent)
             self.assertEqual(agent.planner.last_extracted_text.method, "Method body for notice test.")
+            self.assertEqual(progress_updates[0]["stage"], "planning")
+            self.assertTrue(any(update["stage"] == "searching" for update in progress_updates))
+            self.assertTrue(any(update["stage"] == "processing" for update in progress_updates))
+            self.assertTrue(any(update["stage"] == "reporting" for update in progress_updates))
+            milestone_messages = [item["message"] for item in timeline if item["kind"] == "milestone"]
+            self.assertIn("开始任务规划", milestone_messages)
+            self.assertIn("开始检索多源候选论文", milestone_messages)
+            self.assertIn("开始处理论文：1 篇", milestone_messages)
+            self.assertIn("正在生成报告", milestone_messages)
+
+    def test_run_emits_resolving_progress_for_explain_paper(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            library = PaperLibrary(root / "library")
+            library.upsert_paper(
+                make_paper("2401.12345", "Trust but Verify! A Survey on Verification Design for Test-time Scaling"),
+                make_digest(),
+                b"%PDF-1.4 fake content",
+                [],
+            )
+            plan = RequestPlan(
+                intent="explain_paper",
+                user_goal="介绍论文",
+                search_query="",
+                paper_refs=["Trust but Verify! A Survey on Verification Design for Test-time Scaling"],
+                max_results=1,
+                reuse_local=True,
+                rationale="",
+            )
+            agent = AutoPapersAgent.__new__(AutoPapersAgent)
+            agent.settings = FakeSettings(root)
+            agent.library = library
+            agent.planner = FakePlanner(plan)
+            agent.arxiv = FakeArxivClient({})
+            agent.discovery_search_planner = FakeDiscoverySearchPlanner([])
+            agent.extractor = FakeExtractor(ExtractedPaperContent(method="Explain paper method body."))
+            agent.taxonomy = TopicTaxonomy()
+
+            progress_updates: list[dict[str, object]] = []
+            result = agent.run(
+                "详细介绍这篇论文",
+                progress_callback=progress_updates.append,
+            )
+
+            self.assertIsInstance(result, RunResult)
+            stages = [item["stage"] for item in progress_updates]
+            self.assertIn("resolving", stages)
+            self.assertIn("processing", stages)
+            self.assertIn("reporting", stages)
+
+    def test_run_keeps_processing_progress_when_all_candidates_are_reused(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            library = PaperLibrary(root / "library")
+            paper = make_paper("2604.09999", "Progressive Logging for Agents")
+            library.upsert_paper(paper, make_digest(), b"%PDF-1.4 fake content", [])
+            plan = RequestPlan(
+                intent="discover_papers",
+                user_goal="找论文",
+                search_query="llm uncertainty",
+                paper_refs=[],
+                max_results=1,
+                reuse_local=True,
+                rationale="",
+            )
+            agent = AutoPapersAgent.__new__(AutoPapersAgent)
+            agent.settings = FakeSettings(root)
+            agent.library = library
+            agent.planner = FakePlanner(plan)
+            agent.arxiv = FakeArxivClient({"llm uncertainty": [paper]})
+            agent.discovery_search_planner = FakeDiscoverySearchPlanner([SearchSpec(query="llm uncertainty", field="all")])
+            agent.extractor = FakeExtractor()
+            agent.taxonomy = TopicTaxonomy()
+
+            progress_updates: list[dict[str, object]] = []
+            result = agent.run("帮我找一篇论文", progress_callback=progress_updates.append)
+
+            self.assertIsInstance(result, RunResult)
+            processing_updates = [item for item in progress_updates if item["stage"] == "processing"]
+            self.assertTrue(processing_updates)
+            self.assertEqual(processing_updates[-1]["paper_index"], 1)
+            self.assertEqual(processing_updates[-1]["paper_total"], 1)
+
+    def test_run_refresh_existing_prefers_local_pdf_for_existing_exact_match(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            library = PaperLibrary(root / "library")
+            paper = make_paper("2604.00001", "CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning")
+            library.upsert_paper(paper, make_digest(), b"%PDF-1.4 fake content", [])
+            plan = RequestPlan(
+                intent="explain_paper",
+                user_goal="重新整理论文",
+                search_query="",
+                paper_refs=["CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning"],
+                max_results=1,
+                reuse_local=True,
+                rationale="",
+            )
+            agent = AutoPapersAgent.__new__(AutoPapersAgent)
+            agent.settings = FakeSettings(root)
+            agent.library = library
+            agent.planner = FakePlanner(plan)
+            agent.arxiv = FakeArxivClient({})
+            agent.openreview = FakeSourceClient({})
+            agent.scholar = FakeSourceClient({})
+            agent.discovery_search_planner = FakeDiscoverySearchPlanner([])
+            agent.extractor = FakeExtractor(ExtractedPaperContent(method="Method body for refresh test."))
+            agent.taxonomy = TopicTaxonomy()
+
+            timeline: list[dict[str, object]] = []
+            result = agent.run(
+                "CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning",
+                refresh_existing=True,
+                timeline_callback=timeline.append,
+            )
+
+            self.assertIsInstance(result, RunResult)
+            self.assertEqual(agent.arxiv.downloaded_ids, [])
+            timeline_messages = "\n".join(str(item["message"]) for item in timeline)
+            self.assertIn("已复用本地 PDF 重新整理", timeline_messages)
+            self.assertIn("规划完成：explain_paper", timeline_messages)
+
+    def test_run_skips_candidate_without_parseable_pdf(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            library = PaperLibrary(root / "library")
+            plan = RequestPlan(
+                intent="discover_papers",
+                user_goal="找论文",
+                search_query="llm uncertainty",
+                paper_refs=[],
+                max_results=1,
+                reuse_local=True,
+                rationale="",
+            )
+
+            class NoPdfArxiv(FakeArxivClient):
+                def download_pdf_bytes(self, paper: Paper) -> bytes:
+                    return b""
+
+            agent = AutoPapersAgent.__new__(AutoPapersAgent)
+            agent.settings = FakeSettings(root)
+            agent.library = library
+            agent.planner = FakePlanner(plan)
+            agent.arxiv = NoPdfArxiv({"llm uncertainty": [make_paper("2604.09999", "Progressive Logging for Agents")]})
+            agent.openreview = FakeSourceClient({})
+            agent.scholar = FakeSourceClient({})
+            agent.discovery_search_planner = FakeDiscoverySearchPlanner([SearchSpec(query="llm uncertainty", field="all")])
+            agent.extractor = FakeExtractor(ExtractedPaperContent())
+            agent.taxonomy = TopicTaxonomy()
+
+            timeline: list[dict[str, object]] = []
+            result = agent.run("帮我找一篇论文", timeline_callback=timeline.append)
+
+            self.assertEqual(result.new_papers, [])
+            self.assertEqual(library.list_tree()["stats"]["paper_count"], 0)
+            self.assertIn("已跳过该论文", "\n".join(str(item["message"]) for item in timeline))
+
+    def test_refresh_paper_metadata_updates_cached_venue_and_citations(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            library = PaperLibrary(root / "library")
+            stored = library.upsert_paper(make_paper("2401.12345", "Test Driven Agents"), make_digest(), b"%PDF-1.4 fake", [])
+            updated_paper = make_paper("2401.12345", "Test Driven Agents")
+            updated_paper.venue.name = "ICLR"
+            updated_paper.venue.kind = "conference"
+            updated_paper.venue.year = 2026
+            updated_paper.citation_count = 42
+            updated_paper.citation_source = "google_scholar"
+            updated_paper.citation_updated_at = "2026-04-13T00:00:00+00:00"
+
+            agent = AutoPapersAgent.__new__(AutoPapersAgent)
+            agent.settings = FakeSettings(root)
+            agent.library = library
+            agent.openreview = FakeMetadataClient(updated_paper)
+            agent.scholar = FakeMetadataClient(updated_paper)
+
+            refreshed = agent.refresh_paper_metadata(stored.paper.paper_id)
+
+            self.assertIsNotNone(refreshed)
+            self.assertEqual(refreshed["refresh"]["status"], "updated")
+            self.assertIn("引用量", refreshed["refresh"]["changed_fields"])
+            detail = library.get_paper_detail(stored.paper.paper_id)
+            self.assertEqual(detail["paper"]["venue"]["name"], "ICLR")
+            self.assertEqual(detail["paper"]["citation_count"], 42)
 
     def test_reanalyze_library_updates_existing_records_from_local_pdf(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -476,6 +817,63 @@ class WorkflowDiscoveryTests(unittest.TestCase):
             detail = library.get_paper_detail("2401.12345")
             self.assertEqual(detail["digest"]["one_sentence_takeaway"], "Refreshed from PDF.")
             self.assertIn("重新分析论文 1/1", "\n".join(notices))
+
+    def test_reanalyze_library_format_only_skips_pdf_parse_and_only_tightens_digest_format(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            library = PaperLibrary(root / "library")
+            library.upsert_paper(
+                make_paper("2401.12345", "Trust but Verify! A Survey on Verification Design for Test-time Scaling"),
+                make_digest(),
+                b"%PDF-1.4 fake content",
+                [],
+            )
+            plan = RequestPlan(
+                intent="explain_paper",
+                user_goal="格式更新",
+                search_query="",
+                paper_refs=[],
+                max_results=1,
+                reuse_local=True,
+                rationale="",
+            )
+
+            class FormatOnlyPlanner(FakePlanner):
+                def digest_paper(self, *args, **kwargs) -> PaperDigest:
+                    raise AssertionError("format-only path should not call digest_paper")
+
+                def tighten_digest_format_only(self, paper: Paper, digest: PaperDigest, *, notice_callback=None) -> PaperDigest:
+                    self.format_only_calls.append(paper.paper_id)
+                    refreshed = make_digest()
+                    refreshed.method = "整个方法分为两步。\n\n1. **生成**：先采样候选答案。\n\n2. **验证**：再统一排序。"
+                    refreshed.experiment_setup = "实验分成两个阶段，\n\n先比较候选规模，再比较验证器质量。"
+                    return refreshed
+
+            class FailingExtractor:
+                def extract(self, pdf_bytes: bytes) -> str:
+                    raise AssertionError("format-only path should not extract PDF text")
+
+                def extract_structured(self, pdf_bytes: bytes) -> ExtractedPaperContent:
+                    raise AssertionError("format-only path should not extract PDF text")
+
+            agent = AutoPapersAgent.__new__(AutoPapersAgent)
+            agent.settings = FakeSettings(root)
+            agent.library = library
+            planner = FormatOnlyPlanner(plan)
+            agent.planner = planner
+            agent.extractor = FailingExtractor()
+            agent.taxonomy = TopicTaxonomy()
+
+            notices: list[str] = []
+            updated = agent.reanalyze_library(format_only=True, notice_callback=notices.append)
+
+            self.assertEqual(len(updated), 1)
+            self.assertEqual(planner.format_only_calls, ["2401.12345"])
+            self.assertIsNone(planner.last_extracted_text)
+            self.assertIn("\n\n1. **生成**", updated[0].digest.method)
+            detail = library.get_paper_detail("2401.12345")
+            self.assertEqual(detail["digest"]["experiment_setup"], "实验分成两个阶段，\n\n先比较候选规模，再比较验证器质量。")
+            self.assertIn("仅更新最终格式 1/1", "\n".join(notices))
 
     def test_normalize_library_topics_rehomes_same_family_papers(self) -> None:
         with TemporaryDirectory() as tmp_dir:

@@ -30,11 +30,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("normalize-topics", help="Normalize local paper topics into the canonical taxonomy")
     reanalyze_parser = subparsers.add_parser("reanalyze-library", help="Re-analyze papers from local PDFs")
     reanalyze_parser.add_argument("--limit", type=int, default=None, help="Only re-analyze the most recent N papers")
+    reanalyze_parser.add_argument("--paper-id", action="append", default=None, help="Restrict re-analysis to specific paper IDs")
     reanalyze_parser.add_argument("--arxiv-id", action="append", default=None, help="Restrict re-analysis to specific arXiv IDs")
     reanalyze_parser.add_argument(
         "--download-missing-pdf",
         action="store_true",
         help="Attempt to download the PDF when the local copy is missing",
+    )
+    reanalyze_parser.add_argument(
+        "--format-only",
+        action="store_true",
+        help="Only run the final format-tightening step on existing digests",
     )
     return parser
 
@@ -64,12 +70,15 @@ def main(argv: list[str] | None = None) -> int:
         if not settings.api_key:
             parser.error("MINIMAX_API_KEY is required. Copy .env.example to .env and fill it in.")
         updated = agent.reanalyze_library(
+            paper_ids=args.paper_id,
             arxiv_ids=args.arxiv_id,
             limit=args.limit,
             download_missing_pdf=args.download_missing_pdf,
+            format_only=args.format_only,
             notice_callback=print,
         )
-        print(f"Re-analyzed {len(updated)} paper(s).")
+        action = "Format-updated" if args.format_only else "Re-analyzed"
+        print(f"{action} {len(updated)} paper(s).")
         return 0
 
     if not settings.api_key:
@@ -82,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
             refresh_existing=args.refresh_existing,
         )
     except MiniMaxError as exc:
-        print(f"MiniMax request failed: {exc}", file=sys.stderr)
+        print(f"LLM request failed: {exc}", file=sys.stderr)
         return 2
 
     print(result.report_markdown)

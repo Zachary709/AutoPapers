@@ -5,15 +5,10 @@ import urllib.request
 
 def build_url_opener(proxy_url: str = "") -> urllib.request.OpenerDirector:
     normalized = proxy_url.strip()
-    proxies = (
-        {
+    proxies = {}
+    if normalized:
+        proxies = {
             "http": normalized,
             "https": normalized,
         }
-        if normalized
-        else {
-            "http": None,
-            "https": None,
-        }
-    )
     return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))

@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 from urllib.error import HTTPError, URLError
 
 from autopapers.http_client import build_url_opener
-from autopapers.models import Paper
+from autopapers.models import Paper, VenueInfo
 from autopapers.utils import normalize_whitespace, parse_arxiv_id
 
 
@@ -236,17 +236,21 @@ def parse_feed(xml_text: str) -> list[Paper]:
 
         papers.append(
             Paper(
-                arxiv_id=arxiv_id,
-                versioned_id=versioned_id or arxiv_id,
+                paper_id=arxiv_id,
+                source_primary="arxiv",
                 title=title,
                 abstract=abstract,
                 authors=authors,
                 published=published,
                 updated=updated,
                 entry_id=entry_id,
+                entry_url=entry_id,
                 pdf_url=pdf_url,
                 primary_category=primary_category,
                 categories=categories,
+                arxiv_id=arxiv_id,
+                versioned_id=versioned_id or arxiv_id,
+                venue=VenueInfo(name="arXiv", kind="preprint"),
             )
         )
     return papers

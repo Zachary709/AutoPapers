@@ -2,10 +2,10 @@
 
 AutoPapers 现在是一个前后端式的本地研究工作台：
 
-- 左侧是两级论文目录，按一级方向 / 二级方向组织本地论文。
-- 右侧是任务对话框，用来给 LLM 安排任务。
-- 支持从 arXiv 检索、下载、总结论文，并复用已有本地论文。
-- 支持在界面内查看论文摘要、打开 PDF / Markdown、删除单篇论文。
+- 支持从 arXiv、OpenReview、Google Scholar 检索论文。
+- 只把可下载且可解析 PDF 的论文写入本地库，保持总结基于正文而不是只基于摘要。
+- 会缓存并展示论文的收录信息、来源链接和 Google Scholar 引用数。
+- 支持在界面内查看论文摘要、打开 PDF / Markdown、删除单篇论文，并手动刷新元数据。
 
 ## Requirements
 
@@ -60,9 +60,9 @@ python -m autopapers rebuild-summaries
 
 ## UI Overview
 
-- `Research Directory`: 展示一级方向、二级方向和论文条目，可过滤、选择、删除。
+- `Research Directory`: 展示一级方向、二级方向和论文条目，可过滤、选择、删除，并显示 venue / cited 次数。
 - `Task Console`: 用对话框向 LLM 派发任务，任务完成后自动刷新目录。
-- `Paper Detail Dock`: 显示选中论文的摘要、关键词、方法、发现、局限和 Markdown 预览。
+- `Paper Detail Dock`: 显示选中论文的摘要、关键词、收录信息、引用信息、来源链接和 Markdown 预览。
 
 ## Directory Layout
 
@@ -83,13 +83,15 @@ reports/
 
 ## Architecture
 
-- `src/autopapers/workflows.py`: 端到端论文工作流
+- `src/autopapers/workflows.py`: 端到端论文工作流与多源候选融合
 - `src/autopapers/library.py`: 本地论文库存储、目录树、删除与汇总维护
 - `src/autopapers/web/server.py`: Web server 与 API
 - `src/autopapers/web/jobs.py`: 后台任务队列
 - `src/autopapers/web/static/`: 前端页面、样式和交互脚本
 - `src/autopapers/llm/`: MiniMax 集成与请求规划
 - `src/autopapers/arxiv.py`: arXiv 检索与 PDF 下载
+- `src/autopapers/openreview.py`: OpenReview 检索与元数据解析
+- `src/autopapers/scholar.py`: Google Scholar 检索与引用 / venue 抓取
 - `src/autopapers/http_client.py`: 统一的 HTTP 打开器与代理配置
 
 ## Notes

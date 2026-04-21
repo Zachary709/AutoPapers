@@ -16,6 +16,7 @@ htmlcov/
 # Local runtime data
 library/
 reports/
+.autopapers/
 
 # Temporary files
 _codex_tmp*

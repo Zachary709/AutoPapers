@@ -8,6 +8,8 @@ from autopapers.taxonomy import TopicTaxonomy
 
 def make_paper(identifier: str, title: str, abstract: str = "test abstract", primary_category: str = "cs.CL") -> Paper:
     return Paper(
+        paper_id=identifier,
+        source_primary="arxiv",
         arxiv_id=identifier,
         versioned_id=f"{identifier}v1",
         title=title,
@@ -16,6 +18,7 @@ def make_paper(identifier: str, title: str, abstract: str = "test abstract", pri
         published="2026-01-01T00:00:00Z",
         updated="2026-01-02T00:00:00Z",
         entry_id=f"http://arxiv.org/abs/{identifier}v1",
+        entry_url=f"http://arxiv.org/abs/{identifier}v1",
         pdf_url=f"http://arxiv.org/pdf/{identifier}v1",
         primary_category=primary_category,
         categories=[primary_category],

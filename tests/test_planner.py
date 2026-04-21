@@ -21,6 +21,8 @@ class SparseDigestClient:
 class StructuredDigestClient:
     def chat_text(self, messages, *args, **kwargs) -> str:
         system_prompt = messages[0]["content"]
+        if "摘要翻译器" in system_prompt:
+            return '{"abstract_zh":"本文分析测试时扩展中验证器设计的作用，研究验证器不完美时性能收益如何变化，并给出结构化理解框架。"}'
         if "论文整理器" in system_prompt:
             return '{"major_topic":"测试时扩展","minor_topic":"验证器设计","keywords":["测试时扩展","验证器","推理"]}'
         if "先把论文讲明白" in system_prompt:
@@ -45,6 +47,8 @@ class StructuredDigestClient:
 class CleanupDigestClient:
     def chat_text(self, messages, *args, **kwargs) -> str:
         system_prompt = messages[0]["content"]
+        if "摘要翻译器" in system_prompt:
+            return '{"abstract_zh":"本文研究人类主观不确定性与大语言模型概率式不确定性度量之间的对齐程度，并讨论这些度量是否能更好支持可信交互。"}'
         if "论文整理器" in system_prompt:
             return '{"major_topic":"LLM不确定性与校准","minor_topic":"人类对齐不确定性","keywords":["不确定性","校准","人类对齐"]}'
         if "先把论文讲明白" in system_prompt:
@@ -89,6 +93,8 @@ class FieldCleanupDigestClient:
     def chat_text(self, messages, *args, **kwargs) -> str:
         system_prompt = messages[0]["content"]
         user_prompt = messages[1]["content"]
+        if "摘要翻译器" in system_prompt:
+            return '{"abstract_zh":"本文研究语言模型不确定性是否能够更贴近人类真实的不确定性感受，并探讨其对信任校准的意义。"}'
         if "论文整理器" in system_prompt:
             return '{"major_topic":"LLM不确定性与校准","minor_topic":"人类对齐不确定性","keywords":["不确定性","校准"]}'
         if "先把论文讲明白" in system_prompt:
@@ -121,6 +127,78 @@ class FieldCleanupDigestClient:
         return "{}"
 
 
+class FinalFormattingDigestClient:
+    def chat_text(self, messages, *args, **kwargs) -> str:
+        system_prompt = messages[0]["content"]
+        if "摘要翻译器" in system_prompt:
+            return '{"abstract_zh":"本文系统研究验证器引导的测试时扩展策略。"}'
+        if "论文整理器" in system_prompt:
+            return '{"major_topic":"测试时计算扩展","minor_topic":"验证器与判断器","keywords":["测试时扩展","验证器"]}'
+        if "先把论文讲明白" in system_prompt:
+            return (
+                '{"one_sentence_takeaway":"本文分析验证器质量如何影响测试时扩展效果。",'
+                '"problem":"论文关注验证器质量变化时，候选扩展和重排序策略的收益如何变化。",'
+                '"background":"如果验证器本身有系统误差，更大的候选池可能只会放大错误选择。",'
+                '"relevance":"这项工作适合用来理解测试时扩展中的验证器边界。"}'
+            )
+        if "方法解析器" in system_prompt:
+            return (
+                '{"method":"整个方法分为三步。1. **数据准备**：先统一问题与候选格式。 '
+                '2. **候选生成**：为每个问题采样多个答案。 '
+                '3. **验证重排**：使用验证器对候选重新排序。 '
+                '$$s(y|x)=\\\\log p(y|x)+v(y,x)$$"}'
+            )
+        if "实验分析器" in system_prompt:
+            return (
+                '{"experiment_setup":"实验在数学与代码任务上进行，对比不同候选规模和验证策略。",'
+                '"findings":["验证器越稳定，测试时扩展收益越可靠。","候选规模继续增大时，错误验证器会放大偏差。"],'
+                '"limitations":["分析仍主要基于离线评测。"],'
+                '"improvement_ideas":["引入校准后的验证器。"]}'
+            )
+        if "最终格式规整器" in system_prompt:
+            return (
+                '{"abstract_zh":"本文系统研究验证器引导的测试时扩展策略。",'
+                '"one_sentence_takeaway":"本文分析验证器质量如何影响测试时扩展效果。",'
+                '"problem":"论文关注验证器质量变化时，候选扩展和重排序策略的收益如何变化。",'
+                '"background":"如果验证器本身有系统误差，更大的候选池可能只会放大错误选择。",'
+                '"method":"整个方法分为三步。\\n\\n1. **数据准备**：先统一问题与候选格式。\\n\\n2. **候选生成**：为每个问题采样多个答案。\\n\\n3. **验证重排**：使用验证器对候选重新排序。\\n\\n$$s(y|x)=\\\\log p(y|x)+v(y,x)$$",'
+                '"experiment_setup":"实验在数学与代码任务上进行，\\n\\n对比不同候选规模和验证策略。",'
+                '"findings":["- 验证器越稳定，测试时扩展收益越可靠。","- 候选规模继续增大时，错误验证器会放大偏差。"],'
+                '"limitations":["- 分析仍主要基于离线评测。"],'
+                '"relevance":"这项工作适合用来理解测试时扩展中的验证器边界。",'
+                '"improvement_ideas":["- 引入校准后的验证器。"]}'
+            )
+        return "{}"
+
+
+class FormatRewriteDigestClient(FinalFormattingDigestClient):
+    def chat_text(self, messages, *args, **kwargs) -> str:
+        system_prompt = messages[0]["content"]
+        if "最终格式规整器" in system_prompt:
+            return (
+                '{"method":"整个方法分为四步。\\n\\n1. **数据准备**：先统一问题与候选格式。\\n\\n2. **候选生成**：为每个问题采样多个答案。\\n\\n3. **验证重排**：使用验证器对候选重新排序。\\n\\n$$s(y|x)=\\\\log p(y|x)+v(y,x)$$",'
+                '"findings":["验证器越稳定，测试时扩展收益越可靠。","候选规模继续增大时，正确验证器会放大优势。"]}'
+            )
+        return super().chat_text(messages, *args, **kwargs)
+
+
+class FormatFieldFallbackDigestClient(FinalFormattingDigestClient):
+    def chat_text(self, messages, *args, **kwargs) -> str:
+        system_prompt = messages[0]["content"]
+        user_prompt = messages[1]["content"]
+        if "最终格式规整器" in system_prompt and "待规整字段:" not in user_prompt:
+            return "not valid json"
+        if "最终格式规整器" in system_prompt and "待规整字段: method" in user_prompt:
+            return '{"method":"整个方法分为三步。\\n\\n1. **数据准备**：先统一问题与候选格式。\\n\\n2. **候选生成**：为每个问题采样多个答案。\\n\\n3. **验证重排**：使用验证器对候选重新排序。\\n\\n$$s(y|x)=\\\\log p(y|x)+v(y,x)$$"}'
+        if "最终格式规整器" in system_prompt and "待规整字段: experiment_setup" in user_prompt:
+            return '{"experiment_setup":"实验在数学与代码任务上进行，\\n\\n对比不同候选规模和验证策略。"}'
+        if "最终格式规整器" in system_prompt and "待规整字段: findings" in user_prompt:
+            return '{"findings":["- 验证器越稳定，测试时扩展收益越可靠。","- 候选规模继续增大时，错误验证器会放大偏差。"]}'
+        if "最终格式规整器" in system_prompt and "待规整字段: improvement_ideas" in user_prompt:
+            return '{"improvement_ideas":["- 引入校准后的验证器。"]}'
+        return super().chat_text(messages, *args, **kwargs)
+
+
 class DiscoverWithExplicitRefsClient:
     def chat_text(self, *args, **kwargs) -> str:
         return (
@@ -131,6 +209,16 @@ class DiscoverWithExplicitRefsClient:
             '"CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning"'
             '],"max_results":8,"reuse_local":true,"rationale":"test"}'
         )
+
+
+class CapturingClient:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.calls: list[dict[str, object]] = []
+
+    def chat_text(self, messages, *args, **kwargs) -> str:
+        self.calls.append({"messages": messages, "kwargs": kwargs})
+        return self.response
 
 
 class PlannerResilienceTests(unittest.TestCase):
@@ -155,6 +243,21 @@ class PlannerResilienceTests(unittest.TestCase):
         self.assertEqual(
             plan.paper_refs,
             ["Trust but Verify! A Survey on Verification Design for Test-time Scaling"],
+        )
+
+    def test_plan_request_treats_bare_title_as_explain_paper_on_fallback(self) -> None:
+        planner = Planner(FailingClient(), default_max_results=5)
+
+        plan = planner.plan_request(
+            "CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning",
+            "",
+        )
+
+        self.assertEqual(plan.intent, "explain_paper")
+        self.assertEqual(plan.search_query, "")
+        self.assertEqual(
+            plan.paper_refs,
+            ["CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning"],
         )
 
     def test_plan_request_extracts_multiple_paper_references_on_fallback(self) -> None:
@@ -193,6 +296,34 @@ class PlannerResilienceTests(unittest.TestCase):
             ],
         )
 
+    def test_plan_request_uses_json_schema_response_format_and_strict_json_prompt(self) -> None:
+        client = CapturingClient(
+            '{"intent":"explain_paper","user_goal":"介绍论文","search_query":"","paper_refs":["CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning"],"max_results":1,"reuse_local":true,"rationale":"test"}'
+        )
+        planner = Planner(client, default_max_results=5)
+
+        plan = planner.plan_request("CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning", "")
+
+        self.assertEqual(plan.intent, "explain_paper")
+        call = client.calls[0]
+        response_format = call["kwargs"]["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertEqual(response_format["json_schema"]["name"], "request_plan")
+        self.assertIn("你必须严格输出一个 JSON 对象", call["messages"][0]["content"])
+        self.assertIn("输出检查清单", call["messages"][1]["content"])
+
+    def test_plan_request_logs_raw_response_on_parse_failure(self) -> None:
+        client = CapturingClient("这里是解释，不是 JSON。")
+        planner = Planner(client, default_max_results=5)
+        debug_logs: list[str] = []
+
+        plan = planner.plan_request("CaTS: Calibrated Test-Time Scaling for Efficient LLM Reasoning", "", debug_callback=debug_logs.append)
+
+        self.assertEqual(plan.intent, "explain_paper")
+        self.assertEqual(len(debug_logs), 1)
+        self.assertIn("任务规划 原始模型返回（解析失败）", debug_logs[0])
+        self.assertIn("这里是解释，不是 JSON", debug_logs[0])
+
     def test_fallback_plan_extracts_numbered_paper_lists(self) -> None:
         planner = Planner(FailingClient(), default_max_results=5)
 
@@ -216,6 +347,8 @@ class PlannerResilienceTests(unittest.TestCase):
     def test_digest_paper_falls_back_when_llm_fails(self) -> None:
         planner = Planner(FailingClient(), default_max_results=5)
         paper = Paper(
+            paper_id="2401.12345",
+            source_primary="arxiv",
             arxiv_id="2401.12345",
             versioned_id="2401.12345v1",
             title="Test Driven Agents",
@@ -228,6 +361,7 @@ class PlannerResilienceTests(unittest.TestCase):
             published="2026-01-01T00:00:00Z",
             updated="2026-01-02T00:00:00Z",
             entry_id="http://arxiv.org/abs/2401.12345v1",
+            entry_url="http://arxiv.org/abs/2401.12345v1",
             pdf_url="http://arxiv.org/pdf/2401.12345v1",
             primary_category="cs.AI",
             categories=["cs.AI"],
@@ -237,6 +371,7 @@ class PlannerResilienceTests(unittest.TestCase):
 
         self.assertEqual(digest.major_topic, "CS")
         self.assertEqual(digest.minor_topic, "cs.AI")
+        self.assertEqual(digest.abstract_zh, "")
         self.assertEqual(digest.one_sentence_takeaway, "Reliable agents benefit from explicit verification loops.")
         self.assertEqual(
             digest.findings,
@@ -250,9 +385,48 @@ class PlannerResilienceTests(unittest.TestCase):
         self.assertEqual(digest.experiment_setup, "")
         self.assertEqual(digest.improvement_ideas, [])
 
+    def test_digest_paper_logs_raw_response_when_json_parse_fails(self) -> None:
+        client = CapturingClient("method: explain it in prose")
+        planner = Planner(client, default_max_results=5)
+        paper = Paper(
+            paper_id="2401.12345",
+            source_primary="arxiv",
+            arxiv_id="2401.12345",
+            versioned_id="2401.12345v1",
+            title="Test Driven Agents",
+            abstract="Reliable agents benefit from explicit verification loops.",
+            authors=["Alice"],
+            published="2026-01-01T00:00:00Z",
+            updated="2026-01-02T00:00:00Z",
+            entry_id="http://arxiv.org/abs/2401.12345v1",
+            entry_url="http://arxiv.org/abs/2401.12345v1",
+            pdf_url="http://arxiv.org/pdf/2401.12345v1",
+            primary_category="cs.AI",
+            categories=["cs.AI"],
+        )
+        debug_logs: list[str] = []
+
+        digest = planner.digest_paper(
+            "介绍这篇论文",
+            paper,
+            ExtractedPaperContent(method="Method section."),
+            [],
+            debug_callback=debug_logs.append,
+        )
+
+        self.assertTrue(debug_logs)
+        self.assertIn("原始模型返回（解析失败）", debug_logs[0])
+        self.assertIn("method: explain it in prose", debug_logs[0])
+        first_call = client.calls[0]
+        self.assertEqual(first_call["kwargs"]["response_format"]["type"], "json_schema")
+        self.assertEqual(first_call["kwargs"]["response_format"]["json_schema"]["name"], "abstract_translation")
+        self.assertEqual(digest.one_sentence_takeaway, "Reliable agents benefit from explicit verification loops.")
+
     def test_digest_paper_uses_pdf_sections_for_fallbacks_when_response_is_sparse(self) -> None:
         planner = Planner(SparseDigestClient(), default_max_results=5)
         paper = Paper(
+            paper_id="2401.12346",
+            source_primary="arxiv",
             arxiv_id="2401.12346",
             versioned_id="2401.12346v1",
             title="Sparse Digest Recovery",
@@ -264,6 +438,7 @@ class PlannerResilienceTests(unittest.TestCase):
             published="2026-01-03T00:00:00Z",
             updated="2026-01-03T00:00:00Z",
             entry_id="http://arxiv.org/abs/2401.12346v1",
+            entry_url="http://arxiv.org/abs/2401.12346v1",
             pdf_url="http://arxiv.org/pdf/2401.12346v1",
             primary_category="cs.CL",
             categories=["cs.CL"],
@@ -283,6 +458,7 @@ class PlannerResilienceTests(unittest.TestCase):
 
         digest = planner.digest_paper("介绍这篇论文", paper, extracted, [])
 
+        self.assertEqual(digest.abstract_zh, "")
         self.assertEqual(
             digest.one_sentence_takeaway,
             "We study resilient summary generation for paper libraries.",
@@ -312,6 +488,8 @@ class PlannerResilienceTests(unittest.TestCase):
     def test_digest_paper_merges_staged_structured_outputs(self) -> None:
         planner = Planner(StructuredDigestClient(), default_max_results=5)
         paper = Paper(
+            paper_id="2604.12345",
+            source_primary="arxiv",
             arxiv_id="2604.12345",
             versioned_id="2604.12345v1",
             title="Verifier-Aware Scaling",
@@ -320,6 +498,7 @@ class PlannerResilienceTests(unittest.TestCase):
             published="2026-04-01T00:00:00Z",
             updated="2026-04-02T00:00:00Z",
             entry_id="http://arxiv.org/abs/2604.12345v1",
+            entry_url="http://arxiv.org/abs/2604.12345v1",
             pdf_url="http://arxiv.org/pdf/2604.12345v1",
             primary_category="cs.AI",
             categories=["cs.AI"],
@@ -336,6 +515,7 @@ class PlannerResilienceTests(unittest.TestCase):
 
         self.assertEqual(digest.major_topic, "测试时扩展")
         self.assertEqual(digest.minor_topic, "验证器设计")
+        self.assertIn("验证器设计的作用", digest.abstract_zh)
         self.assertEqual(digest.one_sentence_takeaway, "本文提出面向测试时扩展的验证器敏感分析框架。")
         self.assertIn("验证器不完美时", digest.problem)
         self.assertIn("验证器误差会直接放大", digest.background)
@@ -357,6 +537,8 @@ class PlannerResilienceTests(unittest.TestCase):
     def test_digest_paper_runs_cleanup_for_english_dense_output(self) -> None:
         planner = Planner(CleanupDigestClient(), default_max_results=5)
         paper = Paper(
+            paper_id="2503.12528",
+            source_primary="arxiv",
             arxiv_id="2503.12528",
             versioned_id="2503.12528v1",
             title="Investigating Human-Aligned Large Language Model Uncertainty",
@@ -365,6 +547,7 @@ class PlannerResilienceTests(unittest.TestCase):
             published="2025-03-01T00:00:00Z",
             updated="2025-03-02T00:00:00Z",
             entry_id="http://arxiv.org/abs/2503.12528v1",
+            entry_url="http://arxiv.org/abs/2503.12528v1",
             pdf_url="http://arxiv.org/pdf/2503.12528v1",
             primary_category="cs.CL",
             categories=["cs.CL"],
@@ -381,6 +564,7 @@ class PlannerResilienceTests(unittest.TestCase):
 
         self.assertEqual(digest.major_topic, "LLM不确定性与校准")
         self.assertEqual(digest.minor_topic, "人类对齐不确定性")
+        self.assertIn("主观不确定性", digest.abstract_zh)
         self.assertIn("人类主观不确定性", digest.one_sentence_takeaway)
         self.assertIn("\n\n1. **数据集构建**", digest.method)
         self.assertIn("$$NS=|\\{v_i:\\sum_{j=1}^{|V_k|}P(v_j|q_b)\\leq0.95\\}|$$", digest.method)
@@ -397,6 +581,8 @@ class PlannerResilienceTests(unittest.TestCase):
     def test_digest_paper_runs_field_level_cleanup_for_remaining_english_lists(self) -> None:
         planner = Planner(FieldCleanupDigestClient(), default_max_results=5)
         paper = Paper(
+            paper_id="2503.12528",
+            source_primary="arxiv",
             arxiv_id="2503.12528",
             versioned_id="2503.12528v1",
             title="Investigating Human-Aligned Large Language Model Uncertainty",
@@ -405,6 +591,7 @@ class PlannerResilienceTests(unittest.TestCase):
             published="2025-03-01T00:00:00Z",
             updated="2025-03-02T00:00:00Z",
             entry_id="http://arxiv.org/abs/2503.12528v1",
+            entry_url="http://arxiv.org/abs/2503.12528v1",
             pdf_url="http://arxiv.org/pdf/2503.12528v1",
             primary_category="cs.CL",
             categories=["cs.CL"],
@@ -419,6 +606,7 @@ class PlannerResilienceTests(unittest.TestCase):
 
         digest = planner.digest_paper("详细介绍这篇论文", paper, extracted, [])
 
+        self.assertIn("信任校准", digest.abstract_zh)
         self.assertEqual(
             digest.findings,
             [
@@ -426,3 +614,114 @@ class PlannerResilienceTests(unittest.TestCase):
                 "3折交叉验证表明这种趋势在不同模型上相对稳定。",
             ],
         )
+
+    def test_digest_paper_runs_final_format_tightening_after_staged_generation(self) -> None:
+        planner = Planner(FinalFormattingDigestClient(), default_max_results=5)
+        paper = Paper(
+            paper_id="2604.20001",
+            source_primary="arxiv",
+            arxiv_id="2604.20001",
+            versioned_id="2604.20001v1",
+            title="Verifier-Guided Test-Time Scaling",
+            abstract="We study verifier-guided test-time scaling.",
+            authors=["Eve"],
+            published="2026-04-10T00:00:00Z",
+            updated="2026-04-11T00:00:00Z",
+            entry_id="http://arxiv.org/abs/2604.20001v1",
+            entry_url="http://arxiv.org/abs/2604.20001v1",
+            pdf_url="http://arxiv.org/pdf/2604.20001v1",
+            primary_category="cs.AI",
+            categories=["cs.AI"],
+        )
+        extracted = ExtractedPaperContent(
+            abstract="We study verifier-guided test-time scaling.",
+            introduction="Verifier quality changes the value of larger candidate pools.",
+            method="We compare candidate generation and reranking.",
+            experiments="We evaluate math and code reasoning tasks.",
+            conclusion="Future work studies calibrated verifiers.",
+        )
+
+        digest = planner.digest_paper("详细介绍这篇论文", paper, extracted, [])
+
+        self.assertIn("\n\n1. **数据准备**", digest.method)
+        self.assertIn("\n\n2. **候选生成**", digest.method)
+        self.assertIn("\n\n$$s(y|x)=\\log p(y|x)+v(y,x)$$", digest.method)
+        self.assertEqual(digest.experiment_setup, "实验在数学与代码任务上进行，\n\n对比不同候选规模和验证策略。")
+        self.assertEqual(
+            digest.findings,
+            [
+                "验证器越稳定，测试时扩展收益越可靠。",
+                "候选规模继续增大时，错误验证器会放大偏差。",
+            ],
+        )
+        self.assertEqual(digest.improvement_ideas, ["引入校准后的验证器。"])
+
+    def test_digest_paper_rejects_formatter_rewrites_and_keeps_original_content(self) -> None:
+        planner = Planner(FormatRewriteDigestClient(), default_max_results=5)
+        paper = Paper(
+            paper_id="2604.20002",
+            source_primary="arxiv",
+            arxiv_id="2604.20002",
+            versioned_id="2604.20002v1",
+            title="Verifier-Guided Test-Time Scaling",
+            abstract="We study verifier-guided test-time scaling.",
+            authors=["Eve"],
+            published="2026-04-10T00:00:00Z",
+            updated="2026-04-11T00:00:00Z",
+            entry_id="http://arxiv.org/abs/2604.20002v1",
+            entry_url="http://arxiv.org/abs/2604.20002v1",
+            pdf_url="http://arxiv.org/pdf/2604.20002v1",
+            primary_category="cs.AI",
+            categories=["cs.AI"],
+        )
+        extracted = ExtractedPaperContent(
+            abstract="We study verifier-guided test-time scaling.",
+            introduction="Verifier quality changes the value of larger candidate pools.",
+            method="We compare candidate generation and reranking.",
+            experiments="We evaluate math and code reasoning tasks.",
+            conclusion="Future work studies calibrated verifiers.",
+        )
+
+        digest = planner.digest_paper("详细介绍这篇论文", paper, extracted, [])
+
+        self.assertIn("整个方法分为三步。1. **数据准备**", digest.method)
+        self.assertNotIn("整个方法分为四步", digest.method)
+        self.assertEqual(
+            digest.findings,
+            [
+                "验证器越稳定，测试时扩展收益越可靠。",
+                "候选规模继续增大时，错误验证器会放大偏差。",
+            ],
+        )
+
+    def test_digest_paper_falls_back_to_field_level_format_tightening_when_bulk_parse_fails(self) -> None:
+        planner = Planner(FormatFieldFallbackDigestClient(), default_max_results=5)
+        paper = Paper(
+            paper_id="2604.20003",
+            source_primary="arxiv",
+            arxiv_id="2604.20003",
+            versioned_id="2604.20003v1",
+            title="Verifier-Guided Test-Time Scaling",
+            abstract="We study verifier-guided test-time scaling.",
+            authors=["Eve"],
+            published="2026-04-10T00:00:00Z",
+            updated="2026-04-11T00:00:00Z",
+            entry_id="http://arxiv.org/abs/2604.20003v1",
+            entry_url="http://arxiv.org/abs/2604.20003v1",
+            pdf_url="http://arxiv.org/pdf/2604.20003v1",
+            primary_category="cs.AI",
+            categories=["cs.AI"],
+        )
+        extracted = ExtractedPaperContent(
+            abstract="We study verifier-guided test-time scaling.",
+            introduction="Verifier quality changes the value of larger candidate pools.",
+            method="We compare candidate generation and reranking.",
+            experiments="We evaluate math and code reasoning tasks.",
+            conclusion="Future work studies calibrated verifiers.",
+        )
+
+        digest = planner.digest_paper("详细介绍这篇论文", paper, extracted, [])
+
+        self.assertIn("\n\n1. **数据准备**", digest.method)
+        self.assertEqual(digest.experiment_setup, "实验在数学与代码任务上进行，\n\n对比不同候选规模和验证策略。")
+        self.assertEqual(digest.improvement_ideas, ["引入校准后的验证器。"])

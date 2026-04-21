@@ -25,34 +25,60 @@
             <h2>LLM Dispatch</h2>
           </div>
           <div class="chip-row">
+            <button class="chip chip-button" type="button" id="settingsButton">Settings</button>
             <span class="chip" id="modelChip">Model</span>
             <span class="chip" id="jobChip">Idle</span>
           </div>
         </header>
-
-        <section class="chat-feed" id="chatFeed"></section>
-
-        <form class="composer" id="composerForm">
-          <label class="field">
-            <span>Prompt</span>
-            <textarea
-              id="promptInput"
-              rows="4"
-              placeholder="例如：帮我找最近关于多模态 agent planning 的 arXiv 论文，并结合本地已有论文总结差异。"
-            ></textarea>
-          </label>
-          <div class="composer-controls">
-            <label class="toggle">
-              <input id="refreshExistingInput" type="checkbox">
-              <span>重新整理已存在论文</span>
-            </label>
-            <label class="field field-compact">
-              <span>Max Results</span>
-              <input id="maxResultsInput" type="number" min="1" max="20" placeholder="5">
-            </label>
-            <button class="submit-button" type="submit" id="submitButton">Dispatch to LLM</button>
+        <section class="chat-panel-body" id="chatPanelBody">
+          <div class="chat-feed-wrap" id="chatFeedWrap">
+            <section class="chat-feed" id="chatFeed"></section>
+            <button class="jump-latest hidden" type="button" id="jumpLatestButton">Jump to Latest</button>
           </div>
-        </form>
+          <div
+            class="splitter splitter-horizontal composer-splitter"
+            id="chatComposerSplitter"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="调整对话区和输入区高度"
+            tabindex="0"
+          >
+            <span class="splitter-grip" aria-hidden="true"></span>
+            <span class="splitter-label" aria-hidden="true"></span>
+          </div>
+          <section class="composer-dock" id="composerDock">
+            <div class="composer-dock-header">
+              <div>
+                <div class="eyebrow">Prompt Dock</div>
+                <div class="composer-dock-copy" id="composerDockSummary">输入任务、设置参数，并把执行请求发给模型。</div>
+              </div>
+              <button class="composer-toggle-button" type="button" id="composerCollapseButton" aria-expanded="true">Collapse</button>
+            </div>
+            <div class="composer-body" id="composerBody">
+              <form class="composer" id="composerForm">
+                <label class="field">
+                  <span>Prompt</span>
+                  <textarea
+                    id="promptInput"
+                    rows="4"
+                    placeholder="例如：帮我找最近关于多模态 agent planning 的 arXiv 论文，并结合本地已有论文总结差异。"
+                  ></textarea>
+                </label>
+                <div class="composer-controls">
+                  <label class="toggle">
+                    <input id="refreshExistingInput" type="checkbox">
+                    <span>重新整理已存在论文</span>
+                  </label>
+                  <label class="field field-compact">
+                    <span>Max Results</span>
+                    <input id="maxResultsInput" type="number" min="1" max="20" placeholder="5">
+                  </label>
+                  <button class="submit-button" type="submit" id="submitButton">Dispatch to LLM</button>
+                </div>
+              </form>
+            </div>
+          </section>
+        </section>
       </main>
       <div
         class="splitter splitter-vertical shell-splitter"
@@ -69,12 +95,30 @@
       <aside class="directory-panel" id="directoryPanel">
         <div class="directory-header">
           <div class="eyebrow">AutoPapers Atlas</div>
-          <h1>Paper Directory</h1>
-          <p class="atlas-copy">左侧切一级方向，上方切二级方向，下方像文件列表一样浏览论文。</p>
-          <label class="field field-search">
-            <span>Search Directory</span>
-            <input id="libraryFilter" type="search" placeholder="按主题、标题、线索过滤">
-          </label>
+          <div class="directory-title-row">
+            <h1>Paper Directory</h1>
+            <div class="directory-header-actions">
+              <button
+                class="directory-search-toggle"
+                id="directorySearchToggle"
+                type="button"
+                aria-expanded="false"
+                aria-controls="directorySearchPanel"
+              >
+                <span class="directory-search-toggle-label">Search</span>
+                <span class="directory-search-toggle-dot hidden" id="directorySearchToggleDot" aria-hidden="true"></span>
+              </button>
+            </div>
+          </div>
+          <div class="directory-search-panel hidden" id="directorySearchPanel">
+            <div class="directory-search-panel-header">
+              <span class="directory-search-panel-title">Search Directory</span>
+              <button class="directory-search-close" id="directorySearchClose" type="button" aria-label="关闭搜索面板">Close</button>
+            </div>
+            <label class="field field-search directory-search-field">
+              <input id="libraryFilter" type="search" placeholder="按主题、标题、线索过滤" aria-label="Search Directory">
+            </label>
+          </div>
           <div class="status-banner hidden" id="statusBanner"></div>
           <div class="stats-grid compact-stats" id="libraryStats"></div>
         </div>
@@ -113,6 +157,74 @@
       </aside>
     </div>
     <div class="toast-stack" id="toastStack"></div>
+    <div class="modal-backdrop hidden" id="settingsModal" aria-hidden="true">
+      <div class="modal-card modal-card-tall" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+        <div class="modal-header">
+          <div>
+            <div class="eyebrow">Configuration</div>
+            <h3 id="settingsTitle">Settings</h3>
+          </div>
+          <button class="composer-toggle-button" type="button" id="settingsClose" aria-label="关闭设置弹窗">Close</button>
+        </div>
+        <div class="modal-body modal-body-scroll">
+          <div class="modal-section">
+            <div class="modal-section-header">
+              <div class="eyebrow">LLM API Profiles</div>
+              <p class="muted">管理多份 API 配置，点击切换。当前激活的配置立即生效。</p>
+            </div>
+            <div class="profile-list" id="profileList"></div>
+            <form class="modal-form" id="settingsForm">
+              <label class="field">
+                <span>Profile Name</span>
+                <input id="settingsProfileName" type="text" autocomplete="off" placeholder="My API Config">
+              </label>
+              <label class="field">
+                <span>API Key</span>
+                <input id="settingsApiKey" type="password" autocomplete="off" placeholder="API Key">
+              </label>
+              <label class="field">
+                <span>Model</span>
+                <input id="settingsModel" type="text" autocomplete="off" placeholder="MiniMax-M2.7">
+              </label>
+              <label class="field">
+                <span>API URL</span>
+                <input id="settingsApiUrl" type="text" autocomplete="off" placeholder="https://api.minimaxi.com/v1/text/chatcompletion_v2">
+              </label>
+              <label class="field">
+                <span>HTTP Proxy</span>
+                <input id="settingsProxy" type="text" autocomplete="off" placeholder="http://127.0.0.1:7890">
+              </label>
+              <input type="hidden" id="settingsProfileId" value="">
+              <div class="modal-actions">
+                <button class="button-link" type="submit" id="settingsSave">Save</button>
+                <button class="button-link ghost-button" type="button" id="settingsNewProfile">New</button>
+                <button class="danger-button" type="button" id="settingsDeleteProfile">Delete</button>
+              </div>
+            </form>
+          </div>
+          <div class="modal-section">
+            <div class="modal-section-header">
+              <div class="eyebrow">OpenReview Access</div>
+              <p class="muted" id="openreviewAuthStatusCopy">登录后会把 token 保存到本地，仅当前机器使用。</p>
+            </div>
+            <form class="modal-form" id="openreviewAuthForm">
+              <label class="field">
+                <span>Username</span>
+                <input id="openreviewUsernameInput" type="text" autocomplete="username">
+              </label>
+              <label class="field">
+                <span>Password</span>
+                <input id="openreviewPasswordInput" type="password" autocomplete="current-password">
+              </label>
+              <div class="modal-actions">
+                <button class="button-link" type="submit" id="openreviewLoginSubmit">Login</button>
+                <button class="danger-button" type="button" id="openreviewLogoutButton">Logout</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    </div>
     <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
     <script src="/assets/app.js"></script>

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
 from pathlib import Path
-from threading import Lock, RLock
+from threading import Lock
 from typing import Callable
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from autopapers.config import Settings
 from autopapers.utils import utc_now_iso
@@ -34,63 +35,170 @@ class FileEventLogger:
                 handle.write(line)
 
 
+def _serialize_stored_paper(record, repo_root: Path) -> dict:
+    pdf_path = repo_root / record.pdf_path
+    return {
+        "paper_id": record.paper.paper_id,
+        "arxiv_id": record.paper.arxiv_id,
+        "versioned_id": record.paper.versioned_id,
+        "source_primary": record.paper.source_primary,
+        "title": record.paper.title,
+        "authors": record.paper.authors,
+        "published": record.paper.published,
+        "stored_at": record.stored_at,
+        "major_topic": record.digest.major_topic,
+        "minor_topic": record.digest.minor_topic,
+        "takeaway": record.digest.one_sentence_takeaway,
+        "keywords": record.digest.keywords,
+        "pdf_available": pdf_path.exists(),
+        "venue": asdict(record.paper.venue),
+        "citation_count": record.paper.citation_count,
+        "citation_updated_at": record.paper.citation_updated_at,
+        "links": {
+            "entry": record.paper.entry_url or record.paper.entry_id,
+            "scholar": record.paper.scholar_url,
+            "openreview": record.paper.openreview_url,
+        },
+    }
+
+
+def _run_task_process_entry(
+    repo_root: Path,
+    prompt: str,
+    refresh_existing: bool,
+    max_results: int | None,
+    reporter,
+) -> dict:
+    settings = Settings.from_env(repo_root)
+    agent = AutoPapersAgent(settings)
+    result = agent.run(
+        prompt,
+        max_results=max_results,
+        refresh_existing=refresh_existing,
+        notice_callback=reporter.notice,
+        timeline_callback=reporter.timeline,
+        progress_callback=reporter.progress,
+        confirmation_callback=reporter.confirm,
+        debug_callback=reporter.debug,
+    )
+    return {
+        "plan": asdict(result.plan),
+        "report_markdown": result.report_markdown,
+        "report_path": result.report_path,
+        "new_papers": [_serialize_stored_paper(item, settings.repo_root) for item in result.new_papers],
+        "reused_papers": [_serialize_stored_paper(item, settings.repo_root) for item in result.reused_papers],
+        "related_papers": [_serialize_stored_paper(item, settings.repo_root) for item in result.related_papers],
+        "library": agent.library.list_tree(),
+    }
+
+
 class AutoPapersWebApp:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.agent = AutoPapersAgent(settings)
         self.static_root = Path(__file__).resolve().parent / "static"
-        self._lock = RLock()
         self.logger = FileEventLogger(settings.reports_root / "web-serve.log")
         self.logger.info(
             f"Web app initialized | model={settings.model} | host={settings.web_host}:{settings.web_port}"
         )
-        self.jobs = TaskManager(self._run_task, max_workers=1, event_callback=self._log_job_event)
+        self.jobs = TaskManager(
+            partial(_run_task_process_entry, settings.repo_root),
+            max_workers=1,
+            event_callback=self._log_job_event,
+        )
 
     def close(self) -> None:
         self.logger.info("Web app shutting down")
         self.jobs.close()
 
     def get_library_payload(self) -> dict:
-        with self._lock:
-            library = self.agent.library.list_tree()
+        openreview_status = self.agent.openreview.auth_status()
+        library = self.agent.library.list_tree()
         return {
             "app": {
                 "api_key_configured": bool(self.settings.api_key),
                 "model": self.settings.model,
                 "web_host": self.settings.web_host,
                 "web_port": self.settings.web_port,
+                "openreview": openreview_status,
             },
             "library": library,
         }
 
-    def get_paper_detail(self, arxiv_id: str) -> dict | None:
-        with self._lock:
-            detail = self.agent.library.get_paper_detail(arxiv_id)
+    def get_settings_payload(self) -> dict:
+        openreview_status = self.agent.openreview.auth_status()
+        profiles = self.settings.list_profiles()
+        return {
+            **profiles,
+            "openreview": openreview_status,
+        }
+
+    def handle_settings_action(self, payload: dict) -> dict:
+        action = str(payload.get("action", "")).strip()
+        if action == "save":
+            result = self.settings.save_profile(
+                payload.get("profile_id") or None,
+                payload.get("profile", {}),
+            )
+        elif action == "delete":
+            result = self.settings.delete_profile(
+                str(payload.get("profile_id", "")).strip(),
+            )
+        elif action == "activate":
+            result = self.settings.activate_profile(
+                str(payload.get("profile_id", "")).strip(),
+            )
+        else:
+            return {"error": "unknown action"}
+        self.agent.rebuild_planner()
+        return {
+            **result,
+            "profiles_data": self.settings.list_profiles(),
+            "app": self.get_library_payload()["app"],
+        }
+
+    def get_paper_detail(self, paper_id: str) -> dict | None:
+        detail = self.agent.library.get_paper_detail(paper_id)
+        return self._decorate_paper_detail(paper_id, detail)
+
+    def _decorate_paper_detail(self, paper_id: str, detail: dict | None) -> dict | None:
         if detail is None:
             return None
         detail["download_urls"] = {
-            "pdf": f"/api/papers/{arxiv_id}/pdf" if detail["flags"]["pdf_exists"] else None,
-            "markdown": f"/api/papers/{arxiv_id}/markdown",
+            "pdf": f"/api/papers/{quote(paper_id, safe='')}/pdf" if detail["flags"]["pdf_exists"] else None,
+            "markdown": f"/api/papers/{quote(paper_id, safe='')}/markdown",
         }
         return detail
 
-    def delete_paper(self, arxiv_id: str) -> dict | None:
-        with self._lock:
-            deleted = self.agent.library.delete_paper(arxiv_id)
-            payload = self.get_library_payload() if deleted else None
+    def delete_paper(self, paper_id: str) -> dict | None:
+        deleted = self.agent.library.delete_paper(paper_id)
+        payload = self.get_library_payload() if deleted else None
         return payload
 
-    def get_pdf_path(self, arxiv_id: str) -> Path | None:
-        with self._lock:
-            record = self.agent.library.get_by_arxiv_id(arxiv_id)
+    def refresh_paper_metadata(self, paper_id: str) -> dict | None:
+        refreshed = self.agent.refresh_paper_metadata(paper_id)
+        if refreshed is None:
+            return None
+        record = refreshed["record"]
+        detail = self.agent.library.get_paper_detail(record.paper.paper_id)
+        detail = self._decorate_paper_detail(record.paper.paper_id, detail)
+        detail["metadata_refresh"] = refreshed["refresh"]
+        library_payload = self.get_library_payload()
+        return {
+            "detail": detail,
+            "library": library_payload["library"],
+            "app": library_payload["app"],
+        }
+
+    def get_pdf_path(self, paper_id: str) -> Path | None:
+        record = self.agent.library.get_by_paper_id(paper_id)
         if record is None:
             return None
         path = self.settings.repo_root / record.pdf_path
         return path if path.exists() else None
 
-    def get_markdown_path(self, arxiv_id: str) -> Path | None:
-        with self._lock:
-            record = self.agent.library.get_by_arxiv_id(arxiv_id)
+    def get_markdown_path(self, paper_id: str) -> Path | None:
+        record = self.agent.library.get_by_paper_id(paper_id)
         if record is None:
             return None
         path = self.settings.repo_root / record.md_path
@@ -102,46 +210,21 @@ class AutoPapersWebApp:
     def get_job(self, job_id: str) -> dict | None:
         return self.jobs.get(job_id)
 
-    def _run_task(
-        self,
-        prompt: str,
-        refresh_existing: bool,
-        max_results: int | None,
-        notify: Callable[[str], None],
-    ) -> dict:
-        with self._lock:
-            result = self.agent.run(
-                prompt,
-                max_results=max_results,
-                refresh_existing=refresh_existing,
-                notice_callback=notify,
-            )
-            library_payload = self.get_library_payload()
-        return {
-            "plan": asdict(result.plan),
-            "report_markdown": result.report_markdown,
-            "report_path": result.report_path,
-            "new_papers": [self._serialize_stored_paper(item) for item in result.new_papers],
-            "reused_papers": [self._serialize_stored_paper(item) for item in result.reused_papers],
-            "related_papers": [self._serialize_stored_paper(item) for item in result.related_papers],
-            "library": library_payload["library"],
-        }
+    def cancel_job(self, job_id: str) -> dict | None:
+        return self.jobs.cancel(job_id)
 
-    def _serialize_stored_paper(self, record) -> dict:
-        pdf_path = self.settings.repo_root / record.pdf_path
-        return {
-            "arxiv_id": record.paper.arxiv_id,
-            "versioned_id": record.paper.versioned_id,
-            "title": record.paper.title,
-            "authors": record.paper.authors,
-            "published": record.paper.published,
-            "stored_at": record.stored_at,
-            "major_topic": record.digest.major_topic,
-            "minor_topic": record.digest.minor_topic,
-            "takeaway": record.digest.one_sentence_takeaway,
-            "keywords": record.digest.keywords,
-            "pdf_available": pdf_path.exists(),
-        }
+    def login_openreview(self, username: str, password: str) -> dict:
+        status = self.agent.openreview.login(username, password)
+        payload = self.get_library_payload()
+        return {"status": status, "app": payload["app"]}
+
+    def logout_openreview(self) -> dict:
+        status = self.agent.openreview.logout()
+        payload = self.get_library_payload()
+        return {"status": status, "app": payload["app"]}
+
+    def respond_job_confirmation(self, job_id: str, confirmation_id: str, *, approved: bool) -> dict | None:
+        return self.jobs.respond_confirmation(job_id, confirmation_id, approved=approved)
 
     def _log_job_event(self, job_id: str, kind: str, message: str) -> None:
         payload = f"job={job_id} | {kind.upper()} | {message}"
@@ -188,26 +271,29 @@ def _build_handler(app: AutoPapersWebApp):
             if path == "/api/library":
                 self._json_response(200, app.get_library_payload())
                 return
+            if path == "/api/settings":
+                self._json_response(200, app.get_settings_payload())
+                return
 
             segments = [segment for segment in path.split("/") if segment]
             if len(segments) >= 3 and segments[0] == "api" and segments[1] == "papers":
-                arxiv_id = unquote(segments[2])
+                paper_id = unquote(segments[2])
                 if len(segments) == 3:
-                    detail = app.get_paper_detail(arxiv_id)
+                    detail = app.get_paper_detail(paper_id)
                     if detail is None:
                         self._json_response(404, {"error": "Paper not found"})
                         return
                     self._json_response(200, detail)
                     return
                 if len(segments) == 4 and segments[3] == "pdf":
-                    file_path = app.get_pdf_path(arxiv_id)
+                    file_path = app.get_pdf_path(paper_id)
                     if file_path is None:
                         self._json_response(404, {"error": "PDF not found"})
                         return
                     self._serve_file(file_path, "application/pdf")
                     return
                 if len(segments) == 4 and segments[3] == "markdown":
-                    file_path = app.get_markdown_path(arxiv_id)
+                    file_path = app.get_markdown_path(paper_id)
                     if file_path is None:
                         self._json_response(404, {"error": "Markdown not found"})
                         return
@@ -226,6 +312,71 @@ def _build_handler(app: AutoPapersWebApp):
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
+            segments = [segment for segment in parsed.path.split("/") if segment]
+            if parsed.path == "/api/settings":
+                try:
+                    payload = self._read_json_body()
+                except ValueError:
+                    return
+                result = app.handle_settings_action(payload)
+                if "error" in result:
+                    self._json_response(400, result)
+                    return
+                self._json_response(200, result)
+                return
+            if parsed.path == "/api/openreview/login":
+                try:
+                    payload = self._read_json_body()
+                except ValueError:
+                    return
+                username = str(payload.get("username", "")).strip()
+                password = str(payload.get("password", ""))
+                if not username or not password:
+                    self._json_response(400, {"error": "username and password are required"})
+                    return
+                try:
+                    response_payload = app.login_openreview(username, password)
+                except Exception as exc:
+                    self._json_response(400, {"error": str(exc)})
+                    return
+                self._json_response(200, response_payload)
+                return
+            if parsed.path == "/api/openreview/logout":
+                self._json_response(200, app.logout_openreview())
+                return
+            if len(segments) == 4 and segments[0] == "api" and segments[1] == "papers" and segments[3] == "refresh-metadata":
+                paper_id = unquote(segments[2])
+                payload = app.refresh_paper_metadata(paper_id)
+                if payload is None:
+                    self._json_response(404, {"error": "Paper not found"})
+                    return
+                self._json_response(200, payload)
+                return
+            if len(segments) == 4 and segments[0] == "api" and segments[1] == "tasks" and segments[3] == "confirmation":
+                job_id = unquote(segments[2])
+                try:
+                    payload = self._read_json_body()
+                except ValueError:
+                    return
+                confirmation_id = str(payload.get("confirmation_id", "")).strip()
+                if not confirmation_id:
+                    self._json_response(400, {"error": "confirmation_id is required"})
+                    return
+                approved = bool(payload.get("approved"))
+                job = app.respond_job_confirmation(job_id, confirmation_id, approved=approved)
+                if job is None:
+                    self._json_response(404, {"error": "Confirmation not found"})
+                    return
+                self._json_response(200, {"job": job})
+                return
+            if len(segments) == 4 and segments[0] == "api" and segments[1] == "tasks" and segments[3] == "cancel":
+                job_id = unquote(segments[2])
+                job = app.cancel_job(job_id)
+                if job is None:
+                    self._json_response(404, {"error": "Task not found"})
+                    return
+                self._json_response(200, {"job": job})
+                return
             if parsed.path != "/api/tasks":
                 self._json_response(404, {"error": "Not found"})
                 return
@@ -263,8 +414,8 @@ def _build_handler(app: AutoPapersWebApp):
                 self._json_response(404, {"error": "Not found"})
                 return
 
-            arxiv_id = unquote(segments[2])
-            payload = app.delete_paper(arxiv_id)
+            paper_id = unquote(segments[2])
+            payload = app.delete_paper(paper_id)
             if payload is None:
                 self._json_response(404, {"error": "Paper not found"})
                 return
